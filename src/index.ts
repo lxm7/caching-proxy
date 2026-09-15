@@ -1,5 +1,6 @@
 #!/usr/bin/env -S npx tsx
-import { createServer, request as httpRequest } from "node:http";
+import { createServer } from "node:http";
+import { Readable } from "node:stream";
 
 const PORT = 3000;
 const ORIGIN = "http://dummyjson.com";
@@ -16,7 +17,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   "content-encoding",
 ]);
 
-const server = createServer((req, res) => {
+const server = createServer(async (req, res) => {
   if (req.url === undefined || !req.url.startsWith("/")) {
     res.writeHead(400, { "Content-Type": "text/plain" });
     res.end("Bad Request\n");
@@ -26,28 +27,45 @@ const server = createServer((req, res) => {
   const upstreamUrl = new URL(req.url, ORIGIN);
   console.log(`${req.method} - ${req.url} - ${upstreamUrl.href}`);
 
-  const proxyReq = httpRequest(
-    upstreamUrl,
-    { method: req.method },
-    (upstreamRes) => {
-      for (const [name, value] of Object.entries(upstreamRes.headers)) {
-        if (value === undefined || HOP_BY_HOP_HEADERS.has(name.toLowerCase())) {
-          continue;
-        }
-        res.setHeader(name, value);
-      }
-      res.writeHead(upstreamRes.statusCode ?? 502);
-      upstreamRes.pipe(res);
-    },
-  );
+  const hasBody = req.method !== "GET" && req.method !== "HEAD";
 
-  proxyReq.on("error", (err) => {
+  let upstreamRes;
+  try {
+    upstreamRes = await fetch(upstreamUrl, {
+      method: req.method,
+      body: hasBody ? Readable.toWeb(req) : undefined,
+      duplex: hasBody ? "half" : undefined,
+      // Relay 3xx to the client as-is instead of fetch silently resolving it —
+      // also avoids re-sending a consumed streaming body on a followed redirect.
+      redirect: "manual",
+    });
+  } catch (err) {
     console.error("upstream request failed:", err);
     res.writeHead(502);
     res.end("Bad Gateway\n");
-  });
+    return;
+  }
 
-  req.pipe(proxyReq);
+  for (const [name, value] of upstreamRes.headers) {
+    const lower = name.toLowerCase();
+    if (lower === "set-cookie" || HOP_BY_HOP_HEADERS.has(lower)) {
+      continue;
+    }
+    res.setHeader(name, value);
+  }
+  // headers.entries()/forEach join multiple Set-Cookie into one invalid comma-joined
+  // string; getSetCookie() is the only way to get them back out separately.
+  const setCookie = upstreamRes.headers.getSetCookie();
+  if (setCookie.length > 0) {
+    res.setHeader("set-cookie", setCookie);
+  }
+
+  res.writeHead(upstreamRes.status);
+  if (upstreamRes.body) {
+    Readable.fromWeb(upstreamRes.body).pipe(res);
+  } else {
+    res.end();
+  }
 });
 
 server.listen(PORT, "127.0.0.1", () => {
