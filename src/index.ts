@@ -91,6 +91,7 @@ const server = createServer(async (req, res) => {
   if (setCookie.length > 0) {
     res.setHeader("set-cookie", setCookie);
   }
+  res.setHeader("X-Cache", "MISS");
 
   res.writeHead(upstreamRes.status);
 
