@@ -5,6 +5,7 @@ import { Readable } from "node:stream";
 const PORT = 3000;
 const ORIGIN = "http://dummyjson.com";
 const ORIGIN_HOST = new URL(ORIGIN).host;
+const TTL_MS = 60_000;
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -43,9 +44,10 @@ const server = createServer(async (req, res) => {
   console.log(`${method} - ${req.url} - ${upstreamUrl.href}`);
 
   if (method === "GET") {
-    const cached = cache.get(cacheKey(method, upstreamUrl));
-    if (cached) {
-      console.log(`cache hit - ${upstreamUrl.href}`);
+    const key = cacheKey(method, upstreamUrl);
+    const cached = cache.get(key);
+    if (cached && Date.now() - cached.cachedAt < TTL_MS) {
+      console.log(`HIT ${key}`);
       for (const [name, value] of Object.entries(cached.headers)) {
         res.setHeader(name, value);
       }
@@ -53,6 +55,10 @@ const server = createServer(async (req, res) => {
       res.writeHead(cached.status);
       res.end(cached.body);
       return;
+    }
+    if (cached) {
+      cache.delete(key);
+      console.log(`EXPIRED ${key}`);
     }
   }
 
