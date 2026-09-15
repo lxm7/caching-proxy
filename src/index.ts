@@ -1,8 +1,8 @@
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
 
-const TTL_MS = 60_000;
-const MAX_ENTRIES = 100;
+export const TTL_MS = 60_000;
+export const MAX_ENTRIES = 100;
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",

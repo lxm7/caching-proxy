@@ -11,7 +11,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "tsx --test --experimental-test-coverage --test-coverage-exclude=\"src/**/*.test.ts\" --test-coverage-exclude=\"src/cli.ts\" src/**/*.test.ts"
   },
   "keywords": [],
   "author": "",
