@@ -5,15 +5,36 @@ Commands used to verify `src/index.ts` behaves as intended.
 ## Start the proxy
 
 ```sh
-npx tsx src/index.ts
+npx tsx src/cli.ts --port 3000 --origin http://dummyjson.com
 ```
 
 Detached, for running curl batches against it:
 
 ```sh
-nohup npx tsx src/index.ts > /tmp/cache-proxy-test.log 2>&1 &
+nohup npx tsx src/cli.ts --port 3000 --origin http://dummyjson.com > /tmp/cache-proxy-test.log 2>&1 &
 disown
 ```
+
+## Clear the cache via the CLI
+
+```sh
+npx tsx src/cli.ts --clear-cache
+```
+
+Defaults to port `3000`; pass `--port <number>` if the server is running on
+another one. Thin wrapper over the same `DELETE /_cache` route exercised
+directly below — prints the "Cleared N entries" body and exits non-zero if
+nothing is listening on that port.
+
+## Confirm CLI arg validation
+
+```sh
+npx tsx src/cli.ts --port 3000                              # missing --origin
+npx tsx src/cli.ts --port abc --origin http://dummyjson.com  # non-numeric port
+npx tsx src/cli.ts --clear-cache --port 4999                 # nothing listening on 4999
+```
+Expected: each prints a clear one-line error to stderr and exits non-zero —
+no stack trace.
 
 ## Redirect handling
 
