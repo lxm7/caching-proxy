@@ -3,6 +3,8 @@ import { Readable } from "node:stream";
 
 export const TTL_MS = 60_000;
 export const MAX_ENTRIES = 100;
+export const MAX_ENTRY_BYTES = 1_000_000; // 1MB — single response ceiling
+export const MAX_BYTES = 5_000_000; // 5MB — total cache budget; MAX_ENTRY_BYTES must stay <= this
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -30,6 +32,18 @@ function cacheKey(method: string, url: URL): string {
 export function startServer({ port, origin }: { port: number; origin: string }) {
   const ORIGIN_HOST = new URL(origin).host;
   const cache = new Map<string, CacheEntry>();
+  let totalBytes = 0;
+
+  // Evicts the oldest (LRU) entry; returns false once the cache is empty.
+  function evictOldest(): boolean {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey === undefined) return false;
+    const oldest = cache.get(oldestKey);
+    cache.delete(oldestKey);
+    if (oldest) totalBytes -= oldest.body.byteLength;
+    console.log(`EVICTED ${oldestKey}`);
+    return true;
+  }
 
   const server = createServer(async (req, res) => {
     if (req.url === undefined || !req.url.startsWith("/")) {
@@ -49,6 +63,7 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
     if (method === "DELETE" && upstreamUrl.pathname === "/_cache") {
       const count = cache.size;
       cache.clear();
+      totalBytes = 0;
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end(`Cleared ${count} entries\n`);
       return;
@@ -73,6 +88,7 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
       }
       if (cached) {
         cache.delete(key);
+        totalBytes -= cached.body.byteLength;
         console.log(`EXPIRED ${key}`);
       }
     }
@@ -149,22 +165,42 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
       const upstreamStream = Readable.fromWeb(upstreamRes.body);
       if (cacheable) {
         const chunks: Uint8Array[] = [];
-        upstreamStream.on("data", (chunk: Uint8Array) => chunks.push(chunk));
+        let bufferedSize = 0;
+        let tooLargeToCache = false;
+        upstreamStream.on("data", (chunk: Uint8Array) => {
+          if (tooLargeToCache) return;
+          bufferedSize += chunk.byteLength;
+          if (bufferedSize > MAX_ENTRY_BYTES) {
+            // Over the single-entry ceiling: stop buffering and drop what's
+            // held so far. Client is unaffected — pipe() below is a separate
+            // listener on the same stream.
+            tooLargeToCache = true;
+            chunks.length = 0;
+          } else {
+            chunks.push(chunk);
+          }
+        });
         upstreamStream.on("end", () => {
           const key = cacheKey(method, upstreamUrl);
-          if (!cache.has(key) && cache.size >= MAX_ENTRIES) {
-            const oldestKey = cache.keys().next().value;
-            if (oldestKey !== undefined) {
-              cache.delete(oldestKey);
-              console.log(`EVICTED ${oldestKey}`);
-            }
+          if (tooLargeToCache) {
+            console.log(`SKIPPED (too large) ${key}`);
+            return;
           }
+          const body = Buffer.concat(chunks);
+          const existing = cache.get(key);
+          if (existing) {
+            cache.delete(key);
+            totalBytes -= existing.body.byteLength;
+          }
+          while (cache.size >= MAX_ENTRIES && evictOldest()) {}
+          while (totalBytes + body.byteLength > MAX_BYTES && evictOldest()) {}
           cache.set(key, {
             status: upstreamRes.status,
             headers: cacheableHeaders,
-            body: Buffer.concat(chunks),
+            body,
             cachedAt: Date.now(),
           });
+          totalBytes += body.byteLength;
           console.log(`STORED ${key}`);
         });
       }
