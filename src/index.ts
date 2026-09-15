@@ -44,6 +44,18 @@ const server = createServer(async (req, res) => {
   const upstreamUrl = new URL(req.url, ORIGIN);
   console.log(`${method} - ${req.url} - ${upstreamUrl.href}`);
 
+  // Handled locally, never forwarded: dummyjson.com has no /_cache route, so
+  // this is purely an admin endpoint on the proxy itself. Intercepting it
+  // here (before any upstream fetch) is what lets a `--clear-cache` CLI flag
+  // hit a live process's cache over HTTP instead of needing a restart.
+  if (method === "DELETE" && upstreamUrl.pathname === "/_cache") {
+    const count = cache.size;
+    cache.clear();
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end(`Cleared ${count} entries\n`);
+    return;
+  }
+
   if (method === "GET") {
     const key = cacheKey(method, upstreamUrl);
     const cached = cache.get(key);
