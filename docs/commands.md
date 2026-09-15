@@ -26,8 +26,21 @@ curl -s -D - -o /dev/null -X POST http://127.0.0.1:3000/products/add \
   -d '{"title":"test"}'
 ```
 
-Expected: proxied request reaches upstream with the body intact (same
-status/header relay as GET).
+Expected: proxied request reaches upstream with the body intact, and gets
+back the same `301` relay as GET (not a `502` — `fetch`'s default
+redirect-following can't replay a consumed streaming body on a followed
+redirect, hence `redirect: "manual"` in the fetch call).
+
+## Confirm 3xx is relayed, not silently followed
+
+```sh
+node -e 'fetch("http://dummyjson.com/products/1", { redirect: "manual" }).then(res => console.log(res.status, res.headers.get("location")))'
+```
+
+Expected: `301 https://dummyjson.com/products/1` — confirms Node's `fetch`
+exposes the real redirect response (status/headers) under `redirect:
+"manual"` rather than the spec's opaque-redirect stub, which is what makes
+relaying 3xx through this proxy possible at all.
 
 ## Confirm hop-by-hop headers aren't double-sent
 
@@ -50,6 +63,21 @@ curl -s -D - -o /dev/null http://127.0.0.1:3001/x
 ```
 
 Expected: `HTTP/1.1 502 Bad Gateway` and an `ECONNREFUSED` logged server-side.
+
+## Confirm 400 on malformed request-target
+
+Origin-form (`req.url` undefined, unreachable via curl) and syntactically
+invalid targets get rejected by Node's own HTTP parser before reaching our
+handler. To reach the app-level 400 guard, send a syntactically valid
+absolute-form request-target (what an explicit-proxy client sends), which
+doesn't start with `/`:
+
+```sh
+curl -s -D - -o - -x http://127.0.0.1:3000 http://example.com/anything
+```
+
+Expected: `HTTP/1.1 400 Bad Request`, `Content-Type: text/plain`, body
+`Bad Request` — request is rejected before any upstream call is made.
 
 ## Free port 3000 if a previous run was left listening
 
