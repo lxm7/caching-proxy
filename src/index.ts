@@ -17,7 +17,13 @@ const HOP_BY_HOP_HEADERS = new Set([
 ]);
 
 const server = createServer((req, res) => {
-  const upstreamUrl = new URL(req.url ?? "/", ORIGIN);
+  if (req.url === undefined || !req.url.startsWith("/")) {
+    res.writeHead(400, { "Content-Type": "text/plain" });
+    res.end("Bad Request\n");
+    return;
+  }
+
+  const upstreamUrl = new URL(req.url, ORIGIN);
   console.log(`${req.method} - ${req.url} - ${upstreamUrl.href}`);
 
   const proxyReq = httpRequest(
