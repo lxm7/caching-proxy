@@ -6,6 +6,7 @@ const PORT = 3000;
 const ORIGIN = "http://dummyjson.com";
 const ORIGIN_HOST = new URL(ORIGIN).host;
 const TTL_MS = 60_000;
+const MAX_ENTRIES = 100;
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -47,6 +48,10 @@ const server = createServer(async (req, res) => {
     const key = cacheKey(method, upstreamUrl);
     const cached = cache.get(key);
     if (cached && Date.now() - cached.cachedAt < TTL_MS) {
+      // Map preserves insertion order; re-inserting the key on every hit
+      // moves it to the end, so oldest-first iteration below is LRU, not FIFO.
+      cache.delete(key);
+      cache.set(key, cached);
       console.log(`HIT ${key}`);
       for (const [name, value] of Object.entries(cached.headers)) {
         res.setHeader(name, value);
@@ -137,6 +142,13 @@ const server = createServer(async (req, res) => {
       upstreamStream.on("data", (chunk: Uint8Array) => chunks.push(chunk));
       upstreamStream.on("end", () => {
         const key = cacheKey(method, upstreamUrl);
+        if (!cache.has(key) && cache.size >= MAX_ENTRIES) {
+          const oldestKey = cache.keys().next().value;
+          if (oldestKey !== undefined) {
+            cache.delete(oldestKey);
+            console.log(`EVICTED ${oldestKey}`);
+          }
+        }
         cache.set(key, {
           status: upstreamRes.status,
           headers: cacheableHeaders,
