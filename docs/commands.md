@@ -18,7 +18,7 @@ disown
 ## Build and run from dist (what actually ships)
 
 ```sh
-npm run build
+pnpm build
 node dist/cli.js --port 3000 --origin http://dummyjson.com
 ```
 
@@ -155,3 +155,18 @@ origin is unreachable.
 ```sh
 lsof -ti:3000 | xargs -r kill
 ```
+
+## Run automated tests
+
+```sh
+npx tsc -p tsconfig.json --noEmit
+npm test
+```
+
+`npm test` runs `tsx --test --experimental-test-coverage` over `src/**/*.test.ts`
+(see `package.json`) and prints a line/branch/function coverage report at the
+end. Each test spins up its own stub origin (`node:http`) and its own
+`startServer` instance on port `0`, so tests don't collide with a manually
+running proxy on port 3000 and don't depend on a live upstream like
+dummyjson.com. TTL expiry is exercised via `node:test`'s built-in
+`t.mock.timers` (faking `Date` only) instead of a real 60s wait.
