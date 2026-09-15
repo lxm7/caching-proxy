@@ -1,4 +1,4 @@
-#!/usr/bin/env -S npx tsx
+#!/usr/bin/env node
 import { parseArgs } from "node:util";
 import { startServer } from "./index.js";
 
