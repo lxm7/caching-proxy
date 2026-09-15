@@ -4,6 +4,7 @@ import { Readable } from "node:stream";
 
 const PORT = 3000;
 const ORIGIN = "http://dummyjson.com";
+const ORIGIN_HOST = new URL(ORIGIN).host;
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -57,21 +58,45 @@ const server = createServer(async (req, res) => {
 
   const hasBody = method !== "GET" && method !== "HEAD";
 
-  let upstreamRes;
-  try {
-    upstreamRes = await fetch(upstreamUrl, {
+  const fetchUpstream = (url: URL) =>
+    fetch(url, {
       method,
       body: hasBody ? Readable.toWeb(req) : undefined,
       duplex: hasBody ? "half" : undefined,
-      // Relay 3xx to the client as-is instead of fetch silently resolving it —
-      // also avoids re-sending a consumed streaming body on a followed redirect.
+      // Never let fetch auto-follow: a redirect Location is upstream-controlled,
+      // and following blindly is an SSRF vector (upstream could redirect to an
+      // internal address). Each hop is validated against ORIGIN_HOST below
+      // before we ever issue a second request.
       redirect: "manual",
     });
+
+  let upstreamRes;
+  try {
+    upstreamRes = await fetchUpstream(upstreamUrl);
   } catch (err) {
     console.error("upstream request failed:", err);
     res.writeHead(502);
     res.end("Bad Gateway\n");
     return;
+  }
+
+  // GET/HEAD have no body to replay, so a same-origin http->https redirect
+  // (e.g. dummyjson.com) can be resolved into a cacheable 2xx. Bounded to one
+  // hop, and only followed when Location's host matches ORIGIN — anything
+  // else (different host/port) stays a relayed 3xx rather than being fetched.
+  if (!hasBody && upstreamRes.status >= 300 && upstreamRes.status < 400) {
+    const location = upstreamRes.headers.get("location");
+    const redirectTarget = location ? new URL(location, upstreamUrl) : null;
+    if (redirectTarget && redirectTarget.host === ORIGIN_HOST) {
+      try {
+        upstreamRes = await fetchUpstream(redirectTarget);
+      } catch (err) {
+        console.error("upstream request failed:", err);
+        res.writeHead(502);
+        res.end("Bad Gateway\n");
+        return;
+      }
+    }
   }
 
   // Mirrors the relayed headers, minus set-cookie: the cache is one shared Map across
