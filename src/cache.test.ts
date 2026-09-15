@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { TTL_MS, MAX_ENTRIES } from "./index.js";
-import { setup } from "./utils/testHelpers.js";
+import { TTL_MS, MAX_ENTRIES, MAX_ENTRY_BYTES, MAX_BYTES } from "./index.js";
+import { setup, type RouteHandler } from "./utils/testHelpers.js";
 
 function hasPath(value: unknown): value is { path: string } {
   return (
@@ -70,4 +70,56 @@ test("evicts the least-recently-used entry once MAX_ENTRIES is exceeded", async 
   const survivor = await fetch(`${proxy.url}/item/${MAX_ENTRIES}`);
   assert.equal(survivor.headers.get("x-cache"), "HIT", "most recently inserted entry should still be cached");
   assert.equal(origin.hitCounts.get(`/item/${MAX_ENTRIES}`), 1);
+});
+
+test("response larger than MAX_ENTRY_BYTES is served but never cached", async (t) => {
+  const bigBody = Buffer.alloc(MAX_ENTRY_BYTES + 1, "x");
+  const { origin, proxy } = await setup(t, {
+    "/big": (_req, res) => {
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      res.end(bigBody);
+    },
+  });
+
+  const first = await fetch(`${proxy.url}/big`);
+  const firstBody = await first.arrayBuffer();
+  assert.equal(first.headers.get("x-cache"), "MISS");
+  assert.equal(firstBody.byteLength, bigBody.byteLength, "client should still receive the full body");
+
+  const second = await fetch(`${proxy.url}/big`);
+  assert.equal(second.headers.get("x-cache"), "MISS", "oversized response should not have been cached");
+  assert.equal(origin.hitCounts.get("/big"), 2, "origin is re-fetched every time for an oversized response");
+});
+
+test("total cached bytes are capped, evicting LRU entries to make room", async (t) => {
+  // Each entry is under MAX_ENTRY_BYTES (individually cacheable), but enough
+  // of them together exceed MAX_BYTES, forcing the byte-budget eviction path
+  // rather than the entry-count one.
+  const entrySize = 900_000;
+  const entryCount = Math.ceil(MAX_BYTES / entrySize) + 1;
+  const body = Buffer.alloc(entrySize, "x");
+  const routes: Record<string, RouteHandler> = {};
+  for (let i = 0; i < entryCount; i++) {
+    routes[`/entry-${i}`] = (_req, res) => {
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      res.end(body);
+    };
+  }
+  const { origin, proxy } = await setup(t, routes);
+
+  for (let i = 0; i < entryCount; i++) {
+    // fetch() resolves once headers arrive, not once the body (and the
+    // proxy's async cache.set() that follows it) is fully drained — read the
+    // body so each entry's caching has actually landed before the next request.
+    const res = await fetch(`${proxy.url}/entry-${i}`);
+    await res.arrayBuffer();
+  }
+
+  const evicted = await fetch(`${proxy.url}/entry-0`);
+  assert.equal(evicted.headers.get("x-cache"), "MISS", "oldest entry should have been evicted to stay under MAX_BYTES");
+  assert.equal(origin.hitCounts.get("/entry-0"), 2);
+
+  const survivor = await fetch(`${proxy.url}/entry-${entryCount - 1}`);
+  assert.equal(survivor.headers.get("x-cache"), "HIT", "most recently inserted entry should still be cached");
+  assert.equal(origin.hitCounts.get(`/entry-${entryCount - 1}`), 1);
 });
