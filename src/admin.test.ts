@@ -1,43 +1,8 @@
-import { test, type TestContext } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createServer, type Server } from "node:http";
+import { createServer } from "node:http";
 import { connect } from "node:net";
-import { startServer } from "./index.js";
-
-function getPort(server: Server): number {
-  const address = server.address();
-  if (address === null || typeof address === "string") {
-    throw new Error("expected server to be listening on a network port");
-  }
-  return address.port;
-}
-
-function startProxy(origin: string) {
-  const server = startServer({ port: 0, origin });
-  return new Promise<{ url: string; port: number; server: Server }>((resolve) => {
-    server.on("listening", () => {
-      const port = getPort(server);
-      resolve({ url: `http://127.0.0.1:${port}`, port, server });
-    });
-  });
-}
-
-function startStubOrigin() {
-  const hitCounts = new Map<string, number>();
-  const server = createServer((req, res) => {
-    const path = req.url ?? "/";
-    hitCounts.set(path, (hitCounts.get(path) ?? 0) + 1);
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ path }));
-  });
-  return new Promise<{ url: string; hitCounts: Map<string, number>; server: Server }>(
-    (resolve) => {
-      server.listen(0, "127.0.0.1", () => {
-        resolve({ url: `http://127.0.0.1:${getPort(server)}`, hitCounts, server });
-      });
-    },
-  );
-}
+import { getPort, startProxy, setup } from "./utils/testHelpers.js";
 
 // Returns a loopback origin URL guaranteed to be unreachable: bind a server
 // to an OS-assigned port, then close it immediately. Nothing else grabs an
@@ -65,16 +30,6 @@ function sendRawRequest(port: number, rawRequest: string): Promise<string> {
     socket.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     socket.on("error", reject);
   });
-}
-
-async function setup(t: TestContext) {
-  const origin = await startStubOrigin();
-  const proxy = await startProxy(origin.url);
-  t.after(() => {
-    origin.server.close();
-    proxy.server.close();
-  });
-  return { origin, proxy };
 }
 
 test("DELETE /_cache clears the cache and reports how many entries were removed", async (t) => {

@@ -1,60 +1,6 @@
-import { test, type TestContext } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import { startServer } from "./index.js";
-
-function getPort(server: Server): number {
-  const address = server.address();
-  if (address === null || typeof address === "string") {
-    throw new Error("expected server to be listening on a network port");
-  }
-  return address.port;
-}
-
-function startProxy(origin: string) {
-  const server = startServer({ port: 0, origin });
-  return new Promise<{ url: string; server: Server }>((resolve) => {
-    server.on("listening", () => {
-      resolve({ url: `http://127.0.0.1:${getPort(server)}`, server });
-    });
-  });
-}
-
-type RouteHandler = (req: IncomingMessage, res: ServerResponse) => void;
-
-// Route table keyed by path, so each test can script exactly the
-// redirect/target sequence it needs without a real second host.
-function startStubOrigin(routes: Record<string, RouteHandler>) {
-  const hitCounts = new Map<string, number>();
-  const server = createServer((req, res) => {
-    const path = req.url ?? "/";
-    hitCounts.set(path, (hitCounts.get(path) ?? 0) + 1);
-    const handler = routes[path];
-    if (!handler) {
-      res.writeHead(404);
-      res.end();
-      return;
-    }
-    handler(req, res);
-  });
-  return new Promise<{ url: string; hitCounts: Map<string, number>; server: Server }>(
-    (resolve) => {
-      server.listen(0, "127.0.0.1", () => {
-        resolve({ url: `http://127.0.0.1:${getPort(server)}`, hitCounts, server });
-      });
-    },
-  );
-}
-
-async function setup(t: TestContext, routes: Record<string, RouteHandler>) {
-  const origin = await startStubOrigin(routes);
-  const proxy = await startProxy(origin.url);
-  t.after(() => {
-    origin.server.close();
-    proxy.server.close();
-  });
-  return { origin, proxy };
-}
+import { setup } from "./utils/testHelpers.js";
 
 test("follows a same-host redirect and returns the final response", async (t) => {
   const { origin, proxy } = await setup(t, {
