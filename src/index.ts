@@ -48,6 +48,7 @@ const server = createServer(async (req, res) => {
       for (const [name, value] of Object.entries(cached.headers)) {
         res.setHeader(name, value);
       }
+      res.setHeader("X-Cache", "HIT");
       res.writeHead(cached.status);
       res.end(cached.body);
       return;
