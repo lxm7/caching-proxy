@@ -100,6 +100,20 @@ an already-evicted key re-stores it and, since the cache is still at
 capacity, evicts the *next* LRU entry — so checking a "survivor" key right
 after checking an evicted one can itself get evicted first.
 
+## Confirm DELETE /_cache clears the cache
+
+```sh
+curl -s -o /dev/null http://127.0.0.1:3000/products/1
+curl -s -o /dev/null http://127.0.0.1:3000/products/2
+curl -s -o /dev/null http://127.0.0.1:3000/products/3
+curl -s -D - -o - -X DELETE http://127.0.0.1:3000/_cache   # Cleared 3 entries
+curl -s -D - -o /dev/null http://127.0.0.1:3000/products/1 | grep -i x-cache   # MISS
+curl -s -D - -o - -X DELETE http://127.0.0.1:3000/_cache   # Cleared 1 entries
+```
+Expected: count in the response matches entries present at the time of the
+call; handled locally before any upstream fetch, so it works even if the
+origin is unreachable.
+
 ## Free port 3000 if a previous run was left listening
 
 ```sh
