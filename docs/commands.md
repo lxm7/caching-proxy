@@ -15,6 +15,21 @@ nohup npx tsx src/cli.ts --port 3000 --origin http://dummyjson.com > /tmp/cache-
 disown
 ```
 
+## Build and run from dist (what actually ships)
+
+```sh
+npm run build
+node dist/cli.js --port 3000 --origin http://dummyjson.com
+```
+
+`npx tsx src/cli.ts ...` above runs TypeScript source directly (dev only);
+this runs the compiled plain-JS output `bin` actually points at, with no
+`tsx`/`typescript` needed at runtime.
+
+```sh
+node dist/cli.js --clear-cache
+```
+
 ## Clear the cache via the CLI
 
 ```sh
