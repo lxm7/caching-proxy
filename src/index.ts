@@ -37,15 +37,29 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  const method = req.method ?? "GET";
   const upstreamUrl = new URL(req.url, ORIGIN);
-  console.log(`${req.method} - ${req.url} - ${upstreamUrl.href}`);
+  console.log(`${method} - ${req.url} - ${upstreamUrl.href}`);
 
-  const hasBody = req.method !== "GET" && req.method !== "HEAD";
+  if (method === "GET") {
+    const cached = cache.get(cacheKey(method, upstreamUrl));
+    if (cached) {
+      console.log(`cache hit - ${upstreamUrl.href}`);
+      for (const [name, value] of Object.entries(cached.headers)) {
+        res.setHeader(name, value);
+      }
+      res.writeHead(cached.status);
+      res.end(cached.body);
+      return;
+    }
+  }
+
+  const hasBody = method !== "GET" && method !== "HEAD";
 
   let upstreamRes;
   try {
     upstreamRes = await fetch(upstreamUrl, {
-      method: req.method,
+      method,
       body: hasBody ? Readable.toWeb(req) : undefined,
       duplex: hasBody ? "half" : undefined,
       // Relay 3xx to the client as-is instead of fetch silently resolving it —
@@ -59,12 +73,17 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // Mirrors the relayed headers, minus set-cookie: the cache is one shared Map across
+  // all clients, so replaying one client's cookies to another on a cache hit would leak
+  // sessions. set-cookie still passes through untouched on this (cache-miss) response.
+  const cacheableHeaders: Record<string, string> = {};
   for (const [name, value] of upstreamRes.headers) {
     const lower = name.toLowerCase();
     if (lower === "set-cookie" || HOP_BY_HOP_HEADERS.has(lower)) {
       continue;
     }
     res.setHeader(name, value);
+    cacheableHeaders[name] = value;
   }
   // headers.entries()/forEach join multiple Set-Cookie into one invalid comma-joined
   // string; getSetCookie() is the only way to get them back out separately.
@@ -74,8 +93,27 @@ const server = createServer(async (req, res) => {
   }
 
   res.writeHead(upstreamRes.status);
+
+  const cacheable =
+    method === "GET" && upstreamRes.status >= 200 && upstreamRes.status < 300;
+
   if (upstreamRes.body) {
-    Readable.fromWeb(upstreamRes.body).pipe(res);
+    const upstreamStream = Readable.fromWeb(upstreamRes.body);
+    if (cacheable) {
+      const chunks: Uint8Array[] = [];
+      upstreamStream.on("data", (chunk: Uint8Array) => chunks.push(chunk));
+      upstreamStream.on("end", () => {
+        const key = cacheKey(method, upstreamUrl);
+        cache.set(key, {
+          status: upstreamRes.status,
+          headers: cacheableHeaders,
+          body: Buffer.concat(chunks),
+          cachedAt: Date.now(),
+        });
+        console.log(`STORED ${key}`);
+      });
+    }
+    upstreamStream.pipe(res);
   } else {
     res.end();
   }
