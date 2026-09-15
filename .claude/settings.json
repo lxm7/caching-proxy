@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "input=\"$(cat)\"\nif printf '%s' \"$input\" | jq -e '.stop_hook_active == true' >/dev/null 2>&1; then exit 0; fi\ncwd=\"$(printf '%s' \"$input\" | jq -r '.cwd // empty' 2>/dev/null)\"\n[ -n \"$cwd\" ] && cd \"$cwd\" 2>/dev/null || exit 0\ntranscript=\"$(printf '%s' \"$input\" | jq -r '.transcript_path // empty' 2>/dev/null)\"\n[ -f \"$transcript\" ] || exit 0\ngit rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0\nlast=$(jq -r 'select(.type==\"assistant\") | .message.content[]? | select(.type==\"tool_use\") | if (.name==\"Write\" or .name==\"Edit\") and ((.input.file_path // \"\") | endswith(\"docs/commands.md\")) then \"DOCS\" elif .name==\"Bash\" and ((.input.command // \"\") | test(\"curl|tsx\")) then \"TRIGGER\" else empty end' \"$transcript\" 2>/dev/null | tail -1)\n[ \"$last\" = \"TRIGGER\" ] || exit 0\nreason=\"You ran curl and/or tsx commands to validate behavior, but docs/commands.md has not been updated since. Log the key curl/tsx commands used for validation into docs/commands.md before finishing (commands only, not raw response output such as curl -i headers).\"\njq -cn --arg r \"$reason\" '{decision:\"block\", reason:$r}'",
+            "timeout": 10,
+            "statusMessage": "Checking curl/tsx validation log"
+          }
+        ]
+      }
+    ]
+  }
+}
