@@ -17,6 +17,19 @@ const HOP_BY_HOP_HEADERS = new Set([
   "content-encoding",
 ]);
 
+interface CacheEntry {
+  status: number;
+  headers: Record<string, string>;
+  body: Buffer;
+  cachedAt: number;
+}
+
+const cache = new Map<string, CacheEntry>();
+
+function cacheKey(method: string, url: URL): string {
+  return `${method}:${url.href}`;
+}
+
 const server = createServer(async (req, res) => {
   if (req.url === undefined || !req.url.startsWith("/")) {
     res.writeHead(400, { "Content-Type": "text/plain" });
