@@ -215,6 +215,16 @@ running proxy on port 3000 and don't depend on a live upstream like
 dummyjson.com. TTL expiry is exercised via `node:test`'s built-in
 `t.mock.timers` (faking `Date` only) instead of a real 60s wait.
 
+Run a single test by name (e.g. the gzip `content-length` regression, `plan.md`
+no. 1):
+
+```sh
+npx tsx --test --test-timeout=20000 --test-name-pattern="gzipped" src/cache.test.ts
+```
+
+`--test-timeout` stands in for `timeout`, which macOS doesn't ship, so a hung
+socket fails the run instead of stalling it.
+
 ## Probe: are client request headers forwarded, and is `content-length` still valid?
 
 Neither behaviour is reachable with `curl` against dummyjson.com — one needs an

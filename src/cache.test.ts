@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { gzipSync } from "node:zlib";
 import { TTL_MS, MAX_ENTRIES, MAX_ENTRY_BYTES, MAX_BYTES } from "./index.js";
 import { setup, type RouteHandler } from "./utils/testHelpers.js";
 
@@ -122,4 +123,36 @@ test("total cached bytes are capped, evicting LRU entries to make room", async (
   const survivor = await fetch(`${proxy.url}/entry-${entryCount - 1}`);
   assert.equal(survivor.headers.get("x-cache"), "HIT", "most recently inserted entry should still be cached");
   assert.equal(origin.hitCounts.get(`/entry-${entryCount - 1}`), 1);
+});
+
+test("gzipped origin response is relayed in full on MISS and HIT", async (t) => {
+  // Highly compressible, so the gzip content-length is a small fraction of
+  // the decoded size: a relayed upstream content-length truncates visibly.
+  const decoded = Buffer.from(
+    JSON.stringify({ items: Array.from({ length: 100 }, (_, i) => ({ id: i, name: "item" })) }),
+  );
+  const compressed = gzipSync(decoded);
+  const { origin, proxy } = await setup(t, {
+    "/gz": (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-encoding": "gzip",
+        "content-length": compressed.byteLength,
+      });
+      res.end(compressed);
+    },
+  });
+
+  const miss = await fetch(`${proxy.url}/gz`);
+  const missBody = Buffer.from(await miss.arrayBuffer());
+  assert.equal(miss.headers.get("x-cache"), "MISS");
+  assert.equal(missBody.byteLength, decoded.byteLength, "MISS body should be the full decoded payload");
+  assert.deepEqual(missBody, decoded);
+
+  const hit = await fetch(`${proxy.url}/gz`);
+  const hitBody = Buffer.from(await hit.arrayBuffer());
+  assert.equal(hit.headers.get("x-cache"), "HIT");
+  assert.equal(hitBody.byteLength, decoded.byteLength, "HIT body should be the full decoded payload");
+  assert.deepEqual(hitBody, decoded);
+  assert.equal(origin.hitCounts.get("/gz"), 1);
 });
