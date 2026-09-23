@@ -28,6 +28,9 @@ process or a datastore.
   relayed as a 3xx, never followed.
 - `Set-Cookie` stripped from anything that goes into the shared cache (one
   client's session must not replay to the next caller).
+- `content-encoding` and `content-length` stripped from relayed + cached
+  headers (`DECODED_BODY_HEADERS`), since `fetch` decodes the body — roadmap
+  no. 1.
 - Test coverage: cache hit/miss/eviction, redirect handling incl. the
   cross-host case, admin route incl. origin-down behaviour.
 
@@ -49,7 +52,7 @@ Confirmed live against a stub origin (`startServer` in-process, no live
 `Authorization`, `Accept`, a POST's `Content-Type`: none of it reaches the
 origin. Only undici's own defaults go out.
 
-**Every compressed upstream response is truncated.** `content-encoding` is
+**Every compressed upstream response is truncated.** *(Fixed — no. 1.)* `content-encoding` was
 stripped from the relayed headers (`src/index.ts:9-19`) and `fetch` decodes
 the body, but `content-length` is relayed verbatim (`src/index.ts:142-157`).
 Origin sends 46 gzip bytes framing 2012 bytes of JSON; Node honours the
@@ -64,7 +67,14 @@ authenticated user's response body gets handed to the next anonymous caller.
 
 ---
 
-### 1. Stop relaying a `content-length` that no longer describes the body
+### 1. Stop relaying a `content-length` that no longer describes the body — shipped
+
+**Shipped as:** always-drop, via a dedicated `DECODED_BODY_HEADERS` set split
+out of `HOP_BY_HOP_HEADERS` (neither header is hop-by-hop; a separate set keeps
+a later tidy-up from reintroducing the truncation). HEAD responses lose
+`content-length` too — accepted until the compressed-bytes end state below.
+Regression test: "gzipped origin response is relayed in full on MISS and HIT"
+in `src/cache.test.ts`.
 
 **Why:** confirmed data corruption, above. Security-adjacent — a truncated
 JSON body can parse as a different, still-valid document downstream. Highest

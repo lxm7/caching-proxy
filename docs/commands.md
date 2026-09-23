@@ -283,16 +283,24 @@ and `${}` template literals, which is also why the source path arrives via
 `PROXY_SRC` and a dynamic `import()` rather than being interpolated in — run it
 from the repo root.
 
-Expected, once the issues in `plan.md` nos. 1-2 are fixed:
+To re-run the probe without copy-pasting, extract it from this file:
 
-- the echoed header set contains `authorization`, `x-custom` and
-  `accept: application/json` — currently it contains only undici's own defaults,
-  so no client header reaches the origin (`src/index.ts:98-108` passes no
-  `headers`).
-- `received` equals `decoded`, not `gzip` — currently the proxy strips
-  `content-encoding` but relays `content-length` verbatim
-  (`src/index.ts:142-150`), so Node cuts the body at the compressed length and
-  the client silently gets a truncated response.
+```sh
+sed -n '/^cat > \/tmp\/probe.mjs <<.PROBE.$/,/^PROBE$/p' docs/commands.md | sed '1d;$d' > /tmp/probe.mjs
+PROXY_SRC="$PWD/src/index.ts" npx tsx /tmp/probe.mjs
+```
+
+Expected:
+
+- `received` equals `decoded`, and `content-length` / `content-encoding` print
+  `null` — both are stripped via `DECODED_BODY_HEADERS` in `src/index.ts`,
+  since `fetch` decodes the body and neither header describes it any more
+  (`plan.md` no. 1, fixed; regression-tested by the "gzipped" test in
+  `src/cache.test.ts`).
+- once `plan.md` no. 2 is fixed, the echoed header set contains
+  `authorization`, `x-custom` and `accept: application/json` — currently it
+  contains only undici's own defaults, so no client header reaches the origin
+  (`fetchUpstream` in `src/index.ts` passes no `headers`).
 
 Port `0` on both the stub origin and `startServer` keeps this clear of a proxy
 left listening on 3000, same as the automated tests.

@@ -15,8 +15,12 @@ const HOP_BY_HOP_HEADERS = new Set([
   "trailer",
   "transfer-encoding",
   "upgrade",
-  "content-encoding",
 ]);
+
+// Not hop-by-hop: stripped because fetch decodes the body, so both headers
+// describe the wire bytes, not what we relay. Dropping content-length alone
+// is what prevents Node truncating the body at the compressed length.
+const DECODED_BODY_HEADERS = new Set(["content-encoding", "content-length"]);
 
 interface CacheEntry {
   status: number;
@@ -142,7 +146,11 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
     const cacheableHeaders: Record<string, string> = {};
     for (const [name, value] of upstreamRes.headers) {
       const lower = name.toLowerCase();
-      if (lower === "set-cookie" || HOP_BY_HOP_HEADERS.has(lower)) {
+      if (
+        lower === "set-cookie" ||
+        HOP_BY_HOP_HEADERS.has(lower) ||
+        DECODED_BODY_HEADERS.has(lower)
+      ) {
         continue;
       }
       res.setHeader(name, value);
