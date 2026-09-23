@@ -1,2 +1,11 @@
 node_modules
 dist
+.DS_Store
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# include .claude stuff, ignore global user settings
+!.claude/
+!.claude/**
+.claude/settings.local.json
