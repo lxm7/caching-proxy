@@ -156,6 +156,50 @@ origin is unreachable.
 lsof -ti:3000 | xargs -r kill
 ```
 
+## Confirm the listener is running the code you just edited
+
+```sh
+ps -o pid,etime,command -ax | grep -E 'tsx|cli\.ts|dist/cli' | grep -v grep
+ls -l dist/index.js src/index.ts
+```
+
+A `node dist/cli.js` listener serves whatever was compiled last, so an edit to
+`src/index.ts` changes nothing until `pnpm build` plus a restart — the repro
+then "passes" against the old behaviour. Compare mtimes; if `dist` is older
+than `src`, rebuild or run the source directly:
+
+```sh
+npx tsx src/cli.ts --port 3000 --origin http://dummyjson.com
+```
+
+## Distinguish a dead proxy from a cache state
+
+`%header{x-cache}` is empty when there is no response at all, so a crashed
+proxy prints blank lines that look like a third cache state. Always carry the
+status code:
+
+```sh
+curl -s -o /dev/null -w '[%header{x-cache}] http=%{http_code}\n' "http://127.0.0.1:3000/products/1"
+```
+`http=000` with curl exit 7 means connection refused - nothing is listening.
+
+Same for a concurrent burst:
+
+```sh
+seq 100 | xargs -P 100 -I{} curl -s -o /dev/null -w '%{http_code} %header{x-cache}\n' "http://127.0.0.1:3000$K" | sort | uniq -c
+```
+
+## Capture a proxy crash trace
+
+stderr is unbuffered and stdout is not, so `> log 2>&1` interleaves them and
+shreds the stack trace - a `node:events:497 / throw er;` survives with its
+message overwritten. Split the streams and burst from a second terminal:
+
+```sh
+npx tsx src/cli.ts --port 3000 --origin http://dummyjson.com > /tmp/cache-proxy.out 2> /tmp/cache-proxy.err
+cat /tmp/cache-proxy.err
+```
+
 ## Run automated tests
 
 ```sh
@@ -170,3 +214,75 @@ end. Each test spins up its own stub origin (`node:http`) and its own
 running proxy on port 3000 and don't depend on a live upstream like
 dummyjson.com. TTL expiry is exercised via `node:test`'s built-in
 `t.mock.timers` (faking `Date` only) instead of a real 60s wait.
+
+## Probe: are client request headers forwarded, and is `content-length` still valid?
+
+Neither behaviour is reachable with `curl` against dummyjson.com — one needs an
+origin that echoes back what it received, the other an origin that gzips with a
+known decoded size. Both use an in-process stub instead of the live upstream.
+
+Write the probe to the scratch directory (not the repo):
+
+```sh
+cat > /tmp/probe.mjs <<'PROBE'
+import { createServer } from "node:http";
+import { gzipSync } from "node:zlib";
+const { startServer } = await import(process.env.PROXY_SRC);
+
+const payload = Buffer.from(JSON.stringify({ hello: "x".repeat(2000) }));
+const gz = gzipSync(payload);
+
+const origin = createServer((req, res) => {
+  if (req.url === "/echo-headers") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ got: req.headers }));
+    return;
+  }
+  res.writeHead(200, {
+    "content-type": "application/json",
+    "content-encoding": "gzip",
+    "content-length": String(gz.byteLength),
+  });
+  res.end(gz);
+});
+await new Promise((r) => origin.listen(0, "127.0.0.1", r));
+const oPort = origin.address().port;
+
+const proxy = startServer({ port: 0, origin: `http://127.0.0.1:${oPort}` });
+await new Promise((r) => proxy.once("listening", r));
+const pPort = proxy.address().port;
+
+const r1 = await fetch(`http://127.0.0.1:${pPort}/echo-headers`, {
+  headers: { authorization: "Bearer SECRET", "x-custom": "abc", accept: "application/json" },
+});
+console.log(JSON.stringify((await r1.json()).got, null, 2));
+
+const r2 = await fetch(`http://127.0.0.1:${pPort}/gz`);
+const body = Buffer.from(await r2.arrayBuffer());
+console.log("content-length:", r2.headers.get("content-length"));
+console.log("content-encoding:", r2.headers.get("content-encoding"));
+console.log("gzip", gz.byteLength, "decoded", payload.byteLength, "received", body.byteLength);
+
+proxy.close(); origin.close();
+PROBE
+PROXY_SRC="$PWD/src/index.ts" npx tsx /tmp/probe.mjs
+```
+
+The quoted `<<'PROBE'` heredoc stops the shell touching the script's backticks
+and `${}` template literals, which is also why the source path arrives via
+`PROXY_SRC` and a dynamic `import()` rather than being interpolated in — run it
+from the repo root.
+
+Expected, once the issues in `plan.md` nos. 1-2 are fixed:
+
+- the echoed header set contains `authorization`, `x-custom` and
+  `accept: application/json` — currently it contains only undici's own defaults,
+  so no client header reaches the origin (`src/index.ts:98-108` passes no
+  `headers`).
+- `received` equals `decoded`, not `gzip` — currently the proxy strips
+  `content-encoding` but relays `content-length` verbatim
+  (`src/index.ts:142-150`), so Node cuts the body at the compressed length and
+  the client silently gets a truncated response.
+
+Port `0` on both the stub origin and `startServer` keeps this clear of a proxy
+left listening on 3000, same as the automated tests.
