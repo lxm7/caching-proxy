@@ -31,6 +31,10 @@ no clash with a proxy on 3000.
 npx tsx src/cli.ts --port 3000                               # error: missing --origin
 npx tsx src/cli.ts --port abc --origin http://dummyjson.com  # error: invalid --port
 npx tsx src/cli.ts --clear-cache                             # "Cleared N entries"
+
+# EADDRINUSE (B9, step 5a) — second instance on the same port
+npx tsx src/cli.ts --port 3000 --origin http://dummyjson.com &
+npx tsx src/cli.ts --port 3000 --origin http://dummyjson.com   # "port 3000 in use", exits 1
 ```
 
 ## Cache: MISS → HIT → TTL → LRU → clear

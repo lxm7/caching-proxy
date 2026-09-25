@@ -88,7 +88,11 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  startServer({ port, origin: values.origin });
+  const server = startServer({ port, origin: values.origin });
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    console.error(err.code === "EADDRINUSE" ? `port ${port} in use` : err.message);
+    process.exit(1);
+  });
 }
 
 main();
