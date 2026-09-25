@@ -1,4 +1,4 @@
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { pipeline, Readable } from "node:stream";
 
 export const TTL_MS = 60_000;
@@ -50,7 +50,7 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
     return true;
   }
 
-  const server = createServer(async (req, res) => {
+  async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // `//host/x` and `/\host/x` both start with "/" yet resolve to another host,
     // so the origin check is what keeps the proxy from fetching arbitrary hosts.
     // URL.parse (not the constructor) because e.g. `//[bad` would throw here.
@@ -228,6 +228,22 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
     } else {
       res.end();
     }
+  }
+
+  const server = createServer((req, res) => {
+    handleRequest(req, res).catch((err: unknown) => {
+      // Last-resort net: anything that threw or rejected without being
+      // caught inside handleRequest lands here instead of crashing the
+      // process (an unhandled rejection from an async listener otherwise
+      // takes the whole proxy down for every client, not just this request).
+      console.error(`unhandled error handling ${req.method ?? "?"} ${req.url ?? "?"}:`, err);
+      if (res.headersSent) {
+        res.destroy(err instanceof Error ? err : new Error(String(err)));
+      } else {
+        res.writeHead(502);
+        res.end("Bad Gateway\n");
+      }
+    });
   });
 
   server.listen(port, "127.0.0.1", () => {

@@ -2,6 +2,13 @@
 import { parseArgs } from "node:util";
 import { startServer } from "./index.js";
 
+// Loud, not silent: an uncaught rejection anywhere in the process otherwise
+// exits with a bare stack trace (or, pre-Node 15, is swallowed entirely).
+process.on("unhandledRejection", (reason) => {
+  console.error("unhandled rejection:", reason);
+  process.exit(1);
+});
+
 const USAGE = `Usage:
   caching-proxy --port <number> --origin <url>
   caching-proxy --clear-cache [--port <number>]`;
