@@ -123,6 +123,15 @@ Independent of each other; land in any order. Highest severity, smallest diffs.
 **Land 11–13 before 14.** Forwarding headers (14) without these steps turns the shared
 cache into a leak of one user's authorised responses to the next caller. 15–16 can follow.
 
+**Before starting 11:** reconsider whether `handleRequest` should split into a small
+middleware pipeline (`(req, res, next) => void`, hand-rolled, no dependency — stays inside
+the "Node core only" constraint). Not worth deciding earlier: by this point auth-bypass
+(11), `Cache-Control` (12), `Vary` (15) and header forwarding (14) will show what a
+pipeline stage actually needs to read/write, so the seams can be designed from real
+shape instead of guessed. Doing it here also means every remaining Phase C–F item lands
+as its own stage instead of growing the one function further. Not a blocker — plain
+sequential code in `handleRequest` still works if the answer is "not yet."
+
 ### 11. Bypass the cache for credentialed requests
 - **11a** (~4 lines) If the request has `authorization` or `cookie`, don't look it up and
   don't store it; always MISS. Keying on a credential hash (RFC 9111 §3.5) is deliberately
