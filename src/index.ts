@@ -34,7 +34,8 @@ function cacheKey(method: string, url: URL): string {
 }
 
 export function startServer({ port, origin }: { port: number; origin: string }) {
-  const ORIGIN_HOST = new URL(origin).host;
+  const ORIGIN_URL = new URL(origin);
+  const ORIGIN_HOST = ORIGIN_URL.host;
   const cache = new Map<string, CacheEntry>();
   let totalBytes = 0;
 
@@ -50,14 +51,17 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
   }
 
   const server = createServer(async (req, res) => {
-    if (req.url === undefined || !req.url.startsWith("/")) {
+    // `//host/x` and `/\host/x` both start with "/" yet resolve to another host,
+    // so the origin check is what keeps the proxy from fetching arbitrary hosts.
+    // URL.parse (not the constructor) because e.g. `//[bad` would throw here.
+    const upstreamUrl = req.url?.startsWith("/") ? URL.parse(req.url, origin) : null;
+    if (upstreamUrl === null || upstreamUrl.origin !== ORIGIN_URL.origin) {
       res.writeHead(400, { "Content-Type": "text/plain" });
       res.end("Bad Request\n");
       return;
     }
 
     const method = req.method ?? "GET";
-    const upstreamUrl = new URL(req.url, origin);
     console.log(`${method} - ${req.url} - ${upstreamUrl.href}`);
 
     // Handled locally, never forwarded: dummyjson.com has no /_cache route, so

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { connect } from "node:net";
-import { getPort, startProxy, setup } from "./utils/testHelpers.js";
+import { getPort, startProxy, startStubOrigin, setup } from "./utils/testHelpers.js";
 
 // Returns a loopback origin URL guaranteed to be unreachable: bind a server
 // to an OS-assigned port, then close it immediately. Nothing else grabs an
@@ -82,3 +82,25 @@ test("returns 400 for an absolute-form request-target, without contacting the or
   assert.match(raw, /Bad Request/);
   assert.equal(origin.hitCounts.size, 0, "malformed request-target should be rejected before any upstream call");
 });
+
+// `new URL("//host/x", origin)` resolves to host, not origin — a scheme-relative
+// path would turn the proxy into an open relay to any host (SSRF). `/\` is the
+// same attack: WHATWG URL treats `\` as `/` for http(s). Raw socket because
+// fetch() would normalise both paths before they reach the proxy.
+for (const prefix of ["//", "/\\"]) {
+  test(`returns 400 for a "${prefix}host" request-target, without contacting any host`, async (t) => {
+    const { origin, proxy } = await setup(t);
+    const other = await startStubOrigin();
+    t.after(() => other.server.close());
+    const otherHost = new URL(other.url).host;
+
+    const raw = await sendRawRequest(
+      proxy.port,
+      `GET ${prefix}${otherHost}/secret HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`,
+    );
+
+    assert.match(raw, /^HTTP\/1\.1 400 /);
+    assert.equal(other.hitCounts.size, 0, "proxy must never fetch a host other than the origin");
+    assert.equal(origin.hitCounts.size, 0, "rejected before any upstream call");
+  });
+}

@@ -60,6 +60,18 @@ curl -s -x http://127.0.0.1:3000 http://example.com/   # 400 — absolute-form t
 
 Cross-host redirects and 502-on-unreachable are covered by the automated tests.
 
+SSRF lock (B1, step 1a): any path resolving off the origin is a 400, with no
+upstream log line. `--request-target` sends the path verbatim; plain curl
+would normalise `//` and `\`.
+
+```sh
+sc() { curl -s -o /dev/null -w '%{http_code}\n' --request-target "$1" http://127.0.0.1:3000; }
+sc '//example.com/'    # 400 — scheme-relative path to another host
+sc '/\example.com/'    # 400 — `\` is treated as `/` for http(s)
+sc '//[bad'            # 400 — unparseable, proxy stays up
+npx tsx --test --test-name-pattern='host" request-target' src/admin.test.ts
+```
+
 ## Open bugs (see `plan.md`)
 
 Header forwarding — B4, step 14a:
@@ -69,15 +81,6 @@ curl -s -H 'Authorization: Bearer x' http://127.0.0.1:3000/auth/me
 ```
 Fixed: `Invalid/Expired Token!`. Currently `Access Token is required` — the
 header never reaches the origin.
-
-SSRF via `//host` — B1, step 1a:
-
-```sh
-curl -s --path-as-is -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3000//example.com/
-npx tsx --test --test-name-pattern='host" request-target' src/admin.test.ts
-```
-Fixed: `400`, tests pass. Currently `200` with example.com's page — the proxy
-fetched a host other than the origin.
 
 Crash when upstream dies mid-body — B2, step 2a (becomes an automated test):
 
