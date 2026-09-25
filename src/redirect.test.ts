@@ -61,6 +61,21 @@ test("relays a cross-host redirect as-is without following it", async (t) => {
   assert.equal(origin.hitCounts.get("/redirect-cross-host"), 1);
 });
 
+test("relays a redirect with a malformed Location instead of crashing", async (t) => {
+  const { origin, proxy } = await setup(t, {
+    "/redirect-bad-location": (_req, res) => {
+      res.writeHead(302, { location: "http://[bad" });
+      res.end();
+    },
+  });
+
+  const res = await fetch(`${proxy.url}/redirect-bad-location`, { redirect: "manual" });
+
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.get("location"), "http://[bad");
+  assert.equal(origin.hitCounts.get("/redirect-bad-location"), 1);
+});
+
 test("does not follow a redirect for a request with a body", async (t) => {
   const { origin, proxy } = await setup(t, {
     "/redirect-post": (_req, res) => {

@@ -131,7 +131,10 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
     // else (different host/port) stays a relayed 3xx rather than being fetched.
     if (!hasBody && upstreamRes.status >= 300 && upstreamRes.status < 400) {
       const location = upstreamRes.headers.get("location");
-      const redirectTarget = location ? new URL(location, upstreamUrl) : null;
+      // URL.parse (not the constructor) so a malformed Location — e.g.
+      // `http://[bad` — falls through to relaying the 3xx as-is instead of
+      // throwing outside any try in this async handler.
+      const redirectTarget = location ? URL.parse(location, upstreamUrl) : null;
       if (redirectTarget && redirectTarget.host === ORIGIN_HOST) {
         try {
           upstreamRes = await fetchUpstream(redirectTarget);
