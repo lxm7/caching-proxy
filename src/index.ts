@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { Readable } from "node:stream";
+import { pipeline, Readable } from "node:stream";
 
 export const TTL_MS = 60_000;
 export const MAX_ENTRIES = 100;
@@ -216,7 +216,12 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
           console.log(`STORED ${key}`);
         });
       }
-      upstreamStream.pipe(res);
+      pipeline(upstreamStream, res, (err) => {
+        if (err) {
+          console.error("upstream stream error:", err);
+          res.destroy(err);
+        }
+      });
     } else {
       res.end();
     }
