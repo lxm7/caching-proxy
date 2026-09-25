@@ -32,8 +32,8 @@ reason. Line counts are estimates, not measurements.
 | B3 | From reading | Malformed `Location`: `new URL(location, …)` throws outside any try in the async handler → unhandled rejection → crash | 3 |
 | B4 | From reading | No request headers forwarded (`content-type`, `authorization`, `accept`, `range`) | 14 |
 | B5 | From reading | Cache ignores `Cache-Control`, `Expires` and `Vary` | 11–16 |
-| B6 | From reading | Client disconnect doesn't abort the upstream fetch. The upstream socket is either left stalled (not cacheable) or keeps downloading (cacheable) | 8 |
-| B7 | From reading | No upstream timeout, and server timeouts are left at Node defaults | 7, 9 |
+| B6 | From reading | Client disconnect doesn't abort the upstream fetch. The upstream socket is either left stalled (not cacheable) or keeps downloading (cacheable) | 9 |
+| B7 | From reading | No upstream timeout, and server timeouts are left at Node defaults | 8 |
 | B8 | From reading | `DELETE /_cache` has no auth; reachable by any local process, and by a browser page when the upstream's OPTIONS answer allows it (preflight is sent to the origin and its answer relayed) | 20 |
 | B9 | From reading | No `'error'` handler on `listen`, so `EADDRINUSE` exits with a stack trace | 5 |
 | B10 | From reading | `DELETE /_cache` while a response is still buffering: the `'end'` handler stores the entry after the clear, so a cleared entry reappears | 6 |
@@ -66,10 +66,12 @@ Independent of each other; land in any order. Highest severity, smallest diffs.
   survives.
 
 ### 4. Handler-level safety net
-- **4a** (~8 lines) Wrap the request handler body in try/catch: 502 if headers aren't
-  sent yet, `res.destroy()` if they are. Log with the request's method and path.
-- **4b** (~4 lines, `src/cli.ts`) `process.on("unhandledRejection")` logs and exits
-  non-zero, so a crash is loud rather than silent.
+- **4a** (~12 lines, `src/index.ts` + `src/cli.ts`) Wrap the request handler body in
+  try/catch: 502 if headers aren't sent yet, `res.destroy()` if they are. Log with the
+  request's method and path. Same commit adds `process.on("unhandledRejection")` in
+  `cli.ts` so a crash is loud rather than silent — a handler-level catch without a
+  process-level one still lets other crash sources exit silently, so the two only make
+  sense shipped together.
 
 ### 5. Clean failure on listen error (B9)
 - **5a** (~5 lines, `src/cli.ts`) `server.on("error")`: print
@@ -83,22 +85,32 @@ Independent of each other; land in any order. Highest severity, smallest diffs.
 
 ## Phase B — Resource limits
 
-### 7. Upstream timeout (B7)
-- **7a** (~4 lines) `signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)` on `fetchUpstream`.
-  Map `TimeoutError` to 504, not 502.
-- **7b** (~6 lines) `--timeout <ms>` flag, validated like `parsePort`. Depends on 21a.
+### 7. Configurable knobs — plumbing
+- **7a** (~14 lines) Move `TTL_MS`, `MAX_*` and the timeout into a `config` object passed
+  through `startServer`'s options, with the current constants as defaults. Add a shared
+  `defineFlag(name, parse, validate)` helper (used by every CLI flag in this item and in
+  Phase E) so each flag becomes a 2–3 line call instead of a hand-rolled `parsePort`-style
+  block repeated five times. No new flags exposed yet.
+- Moved earlier than the rest of "Configurable knobs" (originally Phase E, item 21) because
+  8b and 20b need it — doing it here removes the forward dependency those items used to
+  have on a step that hadn't happened yet.
 
-### 8. Abort upstream when the client leaves (B6)
-- **8a** (~8 lines) An `AbortController` per request, aborted on `res` `'close'` if the
-  response didn't finish. Combine it with 7a via `AbortSignal.any([...])`.
+### 8. Timeouts (B7)
+- **8a** (~4 lines) `signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)` on `fetchUpstream`.
+  Map `TimeoutError` to 504, not 502.
+- **8b** (~3 lines) `--timeout <ms>` flag via `defineFlag`.
+- **8c** (~4 lines) Set `headersTimeout`, `requestTimeout` and `keepAliveTimeout` on the
+  server explicitly, to guard against slow clients that trickle headers (Slowloris) and to
+  make the limits visible in code.
+- Merged from two previously separate items (upstream fetch timeout + server-side
+  timeouts): same bug, same test file, no reason to split the commit.
+
+### 9. Abort upstream when the client leaves (B6)
+- **9a** (~8 lines) An `AbortController` per request, aborted on `res` `'close'` if the
+  response didn't finish. Combine it with 8a via `AbortSignal.any([...])`.
 - Must be revisited when 17 lands: a follower disconnecting must not abort the leader's
   fetch.
 - Test: stub streams slowly; client aborts; assert the stub sees its socket close.
-
-### 9. Server-side timeouts (B7)
-- **9a** (~4 lines) Set `headersTimeout`, `requestTimeout` and `keepAliveTimeout` on the
-  server explicitly, to guard against slow clients that trickle headers (Slowloris) and to
-  make the limits visible in code.
 
 ### 10. Graceful shutdown
 - **10a** (~6 lines, `src/cli.ts`) On SIGINT/SIGTERM: `server.close()`, exit when it
@@ -129,13 +141,14 @@ cache into a leak of one user's authorised responses to the next caller. 15–16
   `authorization`, `content-type`, `cookie`, `if-none-match`, `if-modified-since`,
   `range`, `user-agent`. Flatten array values. Never forward `host`, `content-length` or
   `accept-encoding` (undici sets and negotiates these itself). See decision D1.
-- **14b** (~4 lines) Add `X-Forwarded-For` (append), `X-Forwarded-Proto` and `Via`.
-- **14c** (~3 lines) Only attach a request body when the request declares one
+- **14b** (~3 lines) Only attach a request body when the request declares one
   (`content-length > 0` or `transfer-encoding` present). Today DELETE and OPTIONS always
   send a streamed body, which some origins reject. *Unverified; confirm with an echo stub
   first.*
 - Test: echo stub asserts `authorization` arrives **and** the response isn't cached
   (the second assertion is the one that matters).
+- `X-Forwarded-For` / `X-Forwarded-Proto` / `Via` moved to 24e: they don't fix B4, so they
+  don't need to sit on Phase C's strict-order critical path.
 
 ### 15. Honour `Vary`
 - **15a** (~6 lines) Store the response's `Vary` header names on the `CacheEntry`.
@@ -143,14 +156,17 @@ cache into a leak of one user's authorised responses to the next caller. 15–16
   Lookup is two steps: find the entry by URL, then check whether the variant matches.
 - **(unsplittable below ~14 lines)**: 15a on its own changes nothing a test can see; ship
   it with 15b.
+- Kept as full per-header variant keying rather than "bypass cache on any `Vary`": origin
+  request volume is the cost axis this whole plan optimises for, and a bypass rule works
+  directly against it.
 
 ### 16. TTL from origin cache headers instead of a fixed 60s
-- **16a** (~8 lines) Add `ttlMs` to the entry, from `s-maxage` > `max-age` > `Expires`,
-  falling back to `TTL_MS`. The freshness check uses `entry.ttlMs`.
+- **16a** (~14 lines) Add `ttlMs` to the entry, from `s-maxage` > `max-age` > `Expires`,
+  falling back to `TTL_MS`; the freshness check uses `entry.ttlMs`. Same step emits `Age`
+  on a HIT and uses `performance.now()` for cache age, so a wall-clock jump can't expire or
+  revive every entry at once — all three touch the same age/ttl computation, so splitting
+  them added diffs without adding independently-testable behaviour.
 - **16b** (~5 lines) Request-side `Cache-Control: no-cache` / `no-store` skip the lookup.
-- **16c** (~3 lines) Emit `Age` on a HIT.
-- **16d** (~3 lines) Use `performance.now()` for cache age, so a wall-clock jump can't
-  expire or revive every entry at once.
 
 ## Phase D — Origin load and availability
 
@@ -161,7 +177,7 @@ a half-built version either double-fetches or leaves followers hanging.
   promise before fetching and removes it in `finally`; followers await it and replay the
   entry, or fetch on their own if it's `null` (too large or not cacheable).
 - **17b** (~4 lines) Label followers `X-Cache: HIT-COALESCED` (see D3).
-- **17c** Revisit 8a: only the leader's own `res` close counts, and only when there are
+- **17c** Revisit 9a: only the leader's own `res` close counts, and only when there are
   no followers.
 - Test: 20 concurrent requests for one key → origin hit count 1.
 
@@ -189,13 +205,11 @@ a half-built version either double-fetches or leaves followers hanging.
   a `Bearer` header with `crypto.timingSafeEqual`. `--clear-cache` sends it. See D2.
 - **20c** (~5 lines) `--admin-prefix` so `/_cache` can't shadow a real origin path.
 
-### 21. Configurable knobs
-- **21a** (~10 lines) Plumbing only: move `TTL_MS`, `MAX_*` and the timeout into a
-  `config` object passed through `startServer`'s options, with the current constants as
-  defaults. No new flags yet.
-- **21b–e** (~5 lines each) One flag per step: `--ttl`, `--max-entries`, `--max-bytes`
-  (checking `max-entry-bytes <= max-bytes`), `--host`. Each is validated like
-  `parsePort`.
+### 21. Configurable knobs — flags
+Plumbing (config object, `defineFlag` helper) now lives in item 7. Each flag below is a
+`defineFlag` call.
+- **21a–d** (~2–3 lines each) One flag per step: `--ttl`, `--max-entries`, `--max-bytes`
+  (checking `max-entry-bytes <= max-bytes`), `--host`.
 
 ### 22. Stats endpoint
 - **22a** (~6 lines) Counters: hits, misses, evictions, stale serves, upstream errors.
@@ -217,6 +231,9 @@ a half-built version either double-fetches or leaves followers hanging.
 - **24c** (~6 lines, optional) Answer HEAD from a cached GET entry (headers only).
 - **24d** (~4 lines, optional) Strip headers named in the upstream `Connection` header
   (RFC 9110 §7.6.1), not just the fixed hop-by-hop set.
+- **24e** (~4 lines) `X-Forwarded-For` (append), `X-Forwarded-Proto` and `Via`. Moved from
+  Phase C (item 14): doesn't fix a listed bug, no reason to gate the header-forwarding
+  critical path on it.
 
 ---
 
@@ -237,12 +254,12 @@ a half-built version either double-fetches or leaves followers hanging.
 
 **D2 — Admin auth: `Host` check only vs `Host` + token (recommended once `--host` exists)**
 - *Security:* the `Host` check (20a) closes DNS rebinding, which is the real threat on
-  loopback. A token only matters once `--host 0.0.0.0` exists (21e); on loopback it
+  loopback. A token only matters once `--host 0.0.0.0` exists (21d); on loopback it
   doesn't add real protection.
 - *DX:* the token adds a secret to pass to `--clear-cache`. An env var keeps that cheap.
 - *Alternative:* serving admin on a unix socket gives OS-level permissions with no token,
   but it's harder to test and doesn't work for Windows users.
-- Recommendation: ship 20a now. Ship 20b in the same change as 21e (`--host`), not before.
+- Recommendation: ship 20a now. Ship 20b in the same change as 21d (`--host`), not before.
 - **Decided by: security relative to maintainability.**
 
 **D3 — `X-Cache` for coalesced followers: `HIT` vs `MISS` vs `HIT-COALESCED`**
@@ -265,11 +282,12 @@ a half-built version either double-fetches or leaves followers hanging.
 ## Sequencing
 
 1. **Phase A** (1–6): any order, each on its own. Do these first.
-2. **Phase B** (7–10): after A. Item 8 before 17.
+2. **Phase B** (7–10): after A. Do 7 (config plumbing) first — 8b and every later flag
+   depend on it. Item 9 before 17.
 3. **Phase C**: 11 → 12 → 13 → 14, strictly in that order. Then 15 and 16 in either
    order.
-4. **Phase D**: 17 needs 8. 18 needs 14a. 19 needs 16a.
-5. **Phase E**: 21a before any flag. 20b together with 21e. 22 after 20a.
+4. **Phase D**: 17 needs 9. 18 needs 14a. 19 needs 16a.
+5. **Phase E**: 20b together with 21d (`--host`). 22 after 20a.
 6. **Phase F**: any time.
 
 Each step ships with its test in the same commit, not saved up for the end, so the
