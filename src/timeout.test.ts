@@ -14,10 +14,7 @@ test("returns 504 when the upstream exceeds the configured timeout (B7)", async 
       setTimeout(() => res.end("too slow"), 100);
     },
   });
-  const proxy = await startProxy(origin.url, {
-    ...DEFAULT_CONFIG,
-    timeoutMs: 20,
-  });
+  const proxy = await startProxy(origin.url, { ...DEFAULT_CONFIG, timeoutMs: 20 });
   t.after(() => {
     origin.server.close();
     proxy.server.close();
