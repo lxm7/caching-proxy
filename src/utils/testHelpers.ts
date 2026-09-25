@@ -1,6 +1,6 @@
 import type { TestContext } from "node:test";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import { startServer } from "../index.js";
+import { startServer, type ProxyConfig } from "../index.js";
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse) => void;
 
@@ -43,8 +43,8 @@ export function startStubOrigin(routes?: Record<string, RouteHandler>) {
   );
 }
 
-export function startProxy(origin: string) {
-  const server = startServer({ port: 0, origin });
+export function startProxy(origin: string, config?: ProxyConfig) {
+  const server = startServer({ port: 0, origin, config });
   return new Promise<{ url: string; port: number; server: Server }>((resolve) => {
     server.on("listening", () => {
       const port = getPort(server);

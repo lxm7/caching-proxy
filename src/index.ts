@@ -15,7 +15,7 @@ export interface ProxyConfig {
   timeoutMs: number;
 }
 
-const DEFAULT_CONFIG: ProxyConfig = {
+export const DEFAULT_CONFIG: ProxyConfig = {
   ttlMs: TTL_MS,
   maxEntries: MAX_ENTRIES,
   maxEntryBytes: MAX_ENTRY_BYTES,
@@ -48,6 +48,41 @@ interface CacheEntry {
 
 function cacheKey(method: string, url: URL): string {
   return `${method}:${url.href}`;
+}
+
+// Explicit rather than left at Node's defaults (60s/300s/5s), so the limits
+// are visible in code and a slow client trickling headers (Slowloris) can't
+// hold a connection open indefinitely.
+export const HEADERS_TIMEOUT_MS = 10_000;
+export const REQUEST_TIMEOUT_MS = 30_000;
+export const KEEP_ALIVE_TIMEOUT_MS = 5_000;
+
+// AbortSignal.timeout() aborts with a DOMException named "TimeoutError";
+// fetch() surfaces that as the rejection reason.
+function isTimeoutError(err: unknown): boolean {
+  return err instanceof Error && err.name === "TimeoutError";
+}
+
+// Shared by the initial fetch and the one-hop redirect follow: on failure,
+// logs, relays 504 for a timeout or 502 for anything else, and returns null
+// so the caller knows to stop (response is already sent at that point).
+async function fetchOrRelayError(
+  fetchFn: () => Promise<Response>,
+  res: ServerResponse,
+): Promise<Response | null> {
+  try {
+    return await fetchFn();
+  } catch (err) {
+    console.error("upstream request failed:", err);
+    if (isTimeoutError(err)) {
+      res.writeHead(504);
+      res.end("Gateway Timeout\n");
+    } else {
+      res.writeHead(502);
+      res.end("Bad Gateway\n");
+    }
+    return null;
+  }
 }
 
 export function startServer({
@@ -145,17 +180,14 @@ export function startServer({
         // internal address). Each hop is validated against ORIGIN_HOST below
         // before we ever issue a second request.
         redirect: "manual",
+        // Fresh per call (not shared across the redirect hop below), so each
+        // upstream request gets its own full budget rather than splitting one
+        // clock across both.
+        signal: AbortSignal.timeout(config.timeoutMs),
       });
 
-    let upstreamRes;
-    try {
-      upstreamRes = await fetchUpstream(upstreamUrl);
-    } catch (err) {
-      console.error("upstream request failed:", err);
-      res.writeHead(502);
-      res.end("Bad Gateway\n");
-      return;
-    }
+    let upstreamRes = await fetchOrRelayError(() => fetchUpstream(upstreamUrl), res);
+    if (!upstreamRes) return;
 
     // GET/HEAD have no body to replay, so a same-origin http->https redirect
     // (e.g. dummyjson.com) can be resolved into a cacheable 2xx. Bounded to one
@@ -168,14 +200,8 @@ export function startServer({
       // throwing outside any try in this async handler.
       const redirectTarget = location ? URL.parse(location, upstreamUrl) : null;
       if (redirectTarget && redirectTarget.host === ORIGIN_HOST) {
-        try {
-          upstreamRes = await fetchUpstream(redirectTarget);
-        } catch (err) {
-          console.error("upstream request failed:", err);
-          res.writeHead(502);
-          res.end("Bad Gateway\n");
-          return;
-        }
+        upstreamRes = await fetchOrRelayError(() => fetchUpstream(redirectTarget), res);
+        if (!upstreamRes) return;
       }
     }
 
@@ -266,7 +292,11 @@ export function startServer({
     }
   }
 
-  const server = createServer((req, res) => {
+  const server = createServer({
+    headersTimeout: HEADERS_TIMEOUT_MS,
+    requestTimeout: REQUEST_TIMEOUT_MS,
+    keepAliveTimeout: KEEP_ALIVE_TIMEOUT_MS,
+  }, (req, res) => {
     handleRequest(req, res).catch((err: unknown) => {
       // Last-resort net: anything that threw or rejected without being
       // caught inside handleRequest lands here instead of crashing the

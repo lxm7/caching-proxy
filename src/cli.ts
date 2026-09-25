@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
-import { startServer } from "./index.js";
+import { startServer, DEFAULT_CONFIG } from "./index.js";
 
 // Loud, not silent: an uncaught rejection anywhere in the process otherwise
 // exits with a bare stack trace (or, pre-Node 15, is swallowed entirely).
@@ -10,7 +10,7 @@ process.on("unhandledRejection", (reason) => {
 });
 
 const USAGE = `Usage:
-  caching-proxy --port <number> --origin <url>
+  caching-proxy --port <number> --origin <url> [--timeout <ms>]
   caching-proxy --clear-cache [--port <number>]`;
 
 // Wraps parse+validate+report-and-exit into one reusable definition, so each
@@ -32,6 +32,7 @@ function defineFlag<T>(
 }
 
 const parsePort = defineFlag("--port", Number, (n) => Number.isInteger(n) && n >= 1 && n <= 65535);
+const parseTimeout = defineFlag("--timeout", Number, (n) => Number.isInteger(n) && n > 0);
 
 async function clearCache(portArg: string | undefined): Promise<void> {
   const port = portArg !== undefined ? parsePort(portArg) : 3000;
@@ -57,6 +58,7 @@ async function main(): Promise<void> {
   let values: {
     port?: string;
     origin?: string;
+    timeout?: string;
     "clear-cache"?: boolean;
   };
   try {
@@ -64,6 +66,7 @@ async function main(): Promise<void> {
       options: {
         port: { type: "string" },
         origin: { type: "string" },
+        timeout: { type: "string" },
         "clear-cache": { type: "boolean" },
       },
       strict: true,
@@ -94,7 +97,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const server = startServer({ port, origin: values.origin });
+  const config = {
+    ...DEFAULT_CONFIG,
+    ...(values.timeout !== undefined && { timeoutMs: parseTimeout(values.timeout) }),
+  };
+
+  const server = startServer({ port, origin: values.origin, config });
   server.on("error", (err: NodeJS.ErrnoException) => {
     console.error(err.code === "EADDRINUSE" ? `port ${port} in use` : err.message);
     process.exit(1);

@@ -36,6 +36,11 @@ npx tsx src/cli.ts --clear-cache                             # "Cleared N entrie
 # EADDRINUSE (B9, step 5a) — second instance on the same port
 npx tsx src/cli.ts --port 3000 --origin http://dummyjson.com &
 npx tsx src/cli.ts --port 3000 --origin http://dummyjson.com   # "port 3000 in use", exits 1
+
+# --timeout flag (B7, step 8b)
+npx tsx src/cli.ts --port 3001 --origin http://dummyjson.com --timeout abc   # error: invalid --timeout
+npx tsx src/cli.ts --port 3001 --origin http://dummyjson.com --timeout 5000 &
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3001/products/1   # 200 — valid --timeout doesn't break normal requests
 ```
 
 The `--port abc`, `--clear-cache` and EADDRINUSE lines above were re-run unchanged after
