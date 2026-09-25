@@ -13,13 +13,25 @@ const USAGE = `Usage:
   caching-proxy --port <number> --origin <url>
   caching-proxy --clear-cache [--port <number>]`;
 
-function parsePort(value: string): number {
-  const port = Number(value);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`invalid --port: ${value}`);
-  }
-  return port;
+// Wraps parse+validate+report-and-exit into one reusable definition, so each
+// CLI flag (this one, and the Phase E flags still to come) is a 2–3 line
+// call instead of its own hand-rolled parse/throw/catch/exit block.
+function defineFlag<T>(
+  name: string,
+  parse: (raw: string) => T,
+  validate: (value: T) => boolean,
+): (raw: string) => T {
+  return (raw) => {
+    const value = parse(raw);
+    if (!validate(value)) {
+      console.error(`invalid ${name}: ${raw}`);
+      process.exit(1);
+    }
+    return value;
+  };
 }
+
+const parsePort = defineFlag("--port", Number, (n) => Number.isInteger(n) && n >= 1 && n <= 65535);
 
 async function clearCache(portArg: string | undefined): Promise<void> {
   const port = portArg !== undefined ? parsePort(portArg) : 3000;
@@ -73,13 +85,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  let port: number;
-  try {
-    port = parsePort(values.port);
-  } catch (err) {
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exit(1);
-  }
+  const port = parsePort(values.port);
 
   try {
     new URL(values.origin);

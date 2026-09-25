@@ -5,6 +5,23 @@ export const TTL_MS = 60_000;
 export const MAX_ENTRIES = 100;
 export const MAX_ENTRY_BYTES = 1_000_000; // 1MB — single response ceiling
 export const MAX_BYTES = 5_000_000; // 5MB — total cache budget; MAX_ENTRY_BYTES must stay <= this
+export const UPSTREAM_TIMEOUT_MS = 10_000; // default; step 8a wires this into AbortSignal.timeout
+
+export interface ProxyConfig {
+  ttlMs: number;
+  maxEntries: number;
+  maxEntryBytes: number;
+  maxBytes: number;
+  timeoutMs: number;
+}
+
+const DEFAULT_CONFIG: ProxyConfig = {
+  ttlMs: TTL_MS,
+  maxEntries: MAX_ENTRIES,
+  maxEntryBytes: MAX_ENTRY_BYTES,
+  maxBytes: MAX_BYTES,
+  timeoutMs: UPSTREAM_TIMEOUT_MS,
+};
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -33,7 +50,15 @@ function cacheKey(method: string, url: URL): string {
   return `${method}:${url.href}`;
 }
 
-export function startServer({ port, origin }: { port: number; origin: string }) {
+export function startServer({
+  port,
+  origin,
+  config = DEFAULT_CONFIG,
+}: {
+  port: number;
+  origin: string;
+  config?: ProxyConfig;
+}) {
   const ORIGIN_URL = new URL(origin);
   const ORIGIN_HOST = ORIGIN_URL.host;
   const cache = new Map<string, CacheEntry>();
@@ -86,7 +111,7 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
     if (method === "GET") {
       const key = cacheKey(method, upstreamUrl);
       const cached = cache.get(key);
-      if (cached && Date.now() - cached.cachedAt < TTL_MS) {
+      if (cached && Date.now() - cached.cachedAt < config.ttlMs) {
         // Map preserves insertion order; re-inserting the key on every hit
         // moves it to the end, so oldest-first iteration below is LRU, not FIFO.
         cache.delete(key);
@@ -192,7 +217,7 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
         upstreamStream.on("data", (chunk: Uint8Array) => {
           if (tooLargeToCache) return;
           bufferedSize += chunk.byteLength;
-          if (bufferedSize > MAX_ENTRY_BYTES) {
+          if (bufferedSize > config.maxEntryBytes) {
             // Over the single-entry ceiling: stop buffering and drop what's
             // held so far. Client is unaffected — pipe() below is a separate
             // listener on the same stream.
@@ -218,8 +243,8 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
             cache.delete(key);
             totalBytes -= existing.body.byteLength;
           }
-          while (cache.size >= MAX_ENTRIES && evictOldest()) {}
-          while (totalBytes + body.byteLength > MAX_BYTES && evictOldest()) {}
+          while (cache.size >= config.maxEntries && evictOldest()) {}
+          while (totalBytes + body.byteLength > config.maxBytes && evictOldest()) {}
           cache.set(key, {
             status: upstreamRes.status,
             headers: cacheableHeaders,

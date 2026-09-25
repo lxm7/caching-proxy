@@ -38,6 +38,10 @@ npx tsx src/cli.ts --port 3000 --origin http://dummyjson.com &
 npx tsx src/cli.ts --port 3000 --origin http://dummyjson.com   # "port 3000 in use", exits 1
 ```
 
+The `--port abc`, `--clear-cache` and EADDRINUSE lines above were re-run unchanged after
+step 7a (`defineFlag`/config-object refactor) to confirm identical error text and behaviour
+post-refactor.
+
 ## Cache: MISS → HIT → TTL → LRU → clear
 
 ```sh
