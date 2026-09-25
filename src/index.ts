@@ -38,6 +38,11 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
   const ORIGIN_HOST = ORIGIN_URL.host;
   const cache = new Map<string, CacheEntry>();
   let totalBytes = 0;
+  // Bumped on every /_cache clear. A store captures this before fetching and
+  // checks it again in the 'end' handler, so a clear mid-fetch can't have its
+  // own response reappear in the cache right after the client asked for it
+  // to be gone (B10).
+  let generation = 0;
 
   // Evicts the oldest (LRU) entry; returns false once the cache is empty.
   function evictOldest(): boolean {
@@ -72,6 +77,7 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
       const count = cache.size;
       cache.clear();
       totalBytes = 0;
+      generation++;
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end(`Cleared ${count} entries\n`);
       return;
@@ -102,6 +108,7 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
     }
 
     const hasBody = method !== "GET" && method !== "HEAD";
+    const requestGeneration = generation;
 
     const fetchUpstream = (url: URL) =>
       fetch(url, {
@@ -197,6 +204,10 @@ export function startServer({ port, origin }: { port: number; origin: string }) 
         });
         upstreamStream.on("end", () => {
           const key = cacheKey(method, upstreamUrl);
+          if (generation !== requestGeneration) {
+            console.log(`SKIPPED (cleared mid-fetch) ${key}`);
+            return;
+          }
           if (tooLargeToCache) {
             console.log(`SKIPPED (too large) ${key}`);
             return;

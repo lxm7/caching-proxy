@@ -60,6 +60,33 @@ test("DELETE /_cache is handled locally even when the origin is unreachable", as
   assert.equal(body.trim(), "Cleared 0 entries");
 });
 
+test("a clear mid-fetch is not undone by the in-flight request's store (B10)", async (t) => {
+  const { origin, proxy } = await setup(t, {
+    "/slow": (_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      setTimeout(() => res.end(JSON.stringify({ ok: true })), 150);
+    },
+  });
+
+  const slow = fetch(`${proxy.url}/slow`);
+  // Give the request time to reach the stub (headers back, body still
+  // buffering) before racing the clear against it.
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  const clearRes = await fetch(`${proxy.url}/_cache`, { method: "DELETE" });
+  assert.equal(clearRes.status, 200);
+
+  await (await slow).text();
+
+  const after = await fetch(`${proxy.url}/slow`);
+  assert.equal(after.headers.get("x-cache"), "MISS", "store from the pre-clear request must not reappear");
+  assert.equal(
+    origin.hitCounts.get("/slow"),
+    2,
+    "second request should re-hit the origin, not read a resurrected entry",
+  );
+});
+
 test("returns 502 when the origin is unreachable", async (t) => {
   const origin = await unreachableOrigin();
   const proxy = await startProxy(origin);

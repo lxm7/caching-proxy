@@ -20,6 +20,7 @@ lsof -ti:3000 | xargs -r kill   # free the port from a previous run
 npx tsc -p tsconfig.json --noEmit
 npm test
 npx tsx --test --test-timeout=20000 --test-name-pattern="gzipped" src/cache.test.ts   # one test by name
+npx tsx --test --test-name-pattern="B10" src/admin.test.ts   # clear-mid-fetch race, step 6a
 ```
 
 Each test runs its own stub origin and proxy on port `0` — no live upstream,
