@@ -1,334 +1,276 @@
-# Cache Proxy — Plan
+# Cache Proxy — Hardening Plan
 
-Source of truth for behaviour: `docs/requirements.md`. This file tracks what
-shipped for the MVP, then the roadmap: the pieces that separate a demo proxy
-from one you'd actually trust in front of a real API.
+Consolidates the old `plan.md` roadmap (deleted from the working tree, still at
+`git show HEAD:plan.md`) with the 2026-09-25 bug review. Source of truth for behaviour
+remains `docs/requirements.md`.
 
-## Stack
+Constraints carried over unchanged: Node 22, TypeScript, Node core only, in-memory `Map`,
+no second process or datastore. Cost is $0 throughout; the only real cost axis is **origin
+request volume**, which items 17–18 reduce.
 
-Node v22 runtime, TypeScript (native compiler). Node core only — `node:http`
-(`createServer`), `fetch`/undici for the upstream leg, `node:util`
-(`parseArgs`). No proxy or CLI libraries, no disk/Redis persistence: the
-in-memory `Map` is valid *because* `--clear-cache` is an HTTP call into the
-same live process, not a separate reach into someone else's memory. That
-constraint holds for everything below — nothing on this list needs a second
-process or a datastore.
+**Step size rule:** every item is broken into steps of roughly ≤10 changed lines of source
+(tests excluded), each committable on its own with its own test. Where a step can't get
+under ~10 lines without leaving the code broken, it's flagged **(unsplittable)** with the
+reason. Line counts are estimates, not measurements.
 
-## Status: MVP shipped
+## Already shipped
 
-- CLI: `--port`, `--origin`, `--clear-cache` (`src/cli.ts`).
-- Single `http.createServer` handler (`src/index.ts`): cache lookup on
-  `method:url.href`, MISS forwards via `fetch`, buffers the body, stores it.
-- `DELETE /_cache` admin route, checked before any proxy logic so the CLI
-  flag can flush a live process over HTTP.
-- TTL (60s) + LRU eviction at 100 entries, *and* a byte budget (1MB/entry,
-  5MB total) with oldest-first eviction once either cap is hit.
-- SSRF-guarded redirect handling: a same-host `http→https` redirect on a
-  bodyless request is resolved into a cacheable 2xx; a cross-host redirect is
-  relayed as a 3xx, never followed.
-- `Set-Cookie` stripped from anything that goes into the shared cache (one
-  client's session must not replay to the next caller).
-- `content-encoding` and `content-length` stripped from relayed + cached
-  headers (`DECODED_BODY_HEADERS`), since `fetch` decodes the body — roadmap
-  no. 1.
-- Test coverage: cache hit/miss/eviction, redirect handling incl. the
-  cross-host case, admin route incl. origin-down behaviour.
+- MVP: CLI (`--port`, `--origin`, `--clear-cache`), `DELETE /_cache`, 60s TTL, LRU at 100
+  entries, 1MB/entry + 5MB total byte budget.
+- Same-host redirect follow for bodyless requests; cross-host redirects relayed, not
+  followed (tested: `src/redirect.test.ts`).
+- `Set-Cookie` never stored in the shared cache.
+- `content-encoding` / `content-length` stripped from decoded bodies (old plan no. 1;
+  tested: "gzipped origin response…" in `src/cache.test.ts`).
 
-## Roadmap — the top 10 pieces of a proper HTTP cache
+## Known bugs
 
-What makes a cache proxy *proper* isn't more features, it's not being wrong
-in ways nobody notices until it's in front of real traffic. The order below
-is triage order, not interest order — it's roughly the order these bugs get
-found in a real deployment, worst blast-radius first. Two correctness bugs
-(no. 1, no. 2) currently outrank the throughput feature (no. 5) that would
-otherwise be the obvious "add value" move, because right now that feature
-would just make the wrong response arrive faster and get shared wider.
-
-Confirmed live against a stub origin (`startServer` in-process, no live
-`dummyjson.com` dependency):
-
-**Client request headers are silently dropped.** `fetchUpstream`
-(`src/index.ts:98-108`) sends `method`, `body`, `redirect` — no `headers`.
-`Authorization`, `Accept`, a POST's `Content-Type`: none of it reaches the
-origin. Only undici's own defaults go out.
-
-**Every compressed upstream response is truncated.** *(Fixed — no. 1.)* `content-encoding` was
-stripped from the relayed headers (`src/index.ts:9-19`) and `fetch` decodes
-the body, but `content-length` is relayed verbatim (`src/index.ts:142-157`).
-Origin sends 46 gzip bytes framing 2012 bytes of JSON; Node honours the
-`content-length` header and cuts the socket at byte 46. No error surfaces —
-the client just gets a truncated body, and the cache stores the full 2012
-bytes, so the HIT path repeats the mismatch. Any origin that gzips (most of
-them) is corrupted today.
-
-Fixing those two is a prerequisite for no. 3: forwarding headers without
-fixing the cache key is how you turn a URL-keyed cache into a place where one
-authenticated user's response body gets handed to the next anonymous caller.
+| ID | Status | Bug | Fixed by |
+|----|--------|-----|----------|
+| B1 | **Reproduced** | `//host/x` or `/\host/x` request path resolves to another host via `new URL(req.url, origin)`, so the proxy fetches any host and caches it (SSRF). The redirect guard doesn't help: the first request already leaves the origin | 1 |
+| B2 | **Reproduced** | Upstream dying mid-body crashes the process: `pipe()` doesn't forward errors, and there's no `'error'` listener on `Readable.fromWeb` | 2 |
+| B3 | From reading | Malformed `Location`: `new URL(location, …)` throws outside any try in the async handler → unhandled rejection → crash | 3 |
+| B4 | From reading | No request headers forwarded (`content-type`, `authorization`, `accept`, `range`) | 14 |
+| B5 | From reading | Cache ignores `Cache-Control`, `Expires` and `Vary` | 11–16 |
+| B6 | From reading | Client disconnect doesn't abort the upstream fetch. The upstream socket is either left stalled (not cacheable) or keeps downloading (cacheable) | 8 |
+| B7 | From reading | No upstream timeout, and server timeouts are left at Node defaults | 7, 9 |
+| B8 | From reading | `DELETE /_cache` has no auth; reachable by any local process, and by a browser page when the upstream's OPTIONS answer allows it (preflight is sent to the origin and its answer relayed) | 20 |
+| B9 | From reading | No `'error'` handler on `listen`, so `EADDRINUSE` exits with a stack trace | 5 |
+| B10 | From reading | `DELETE /_cache` while a response is still buffering: the `'end'` handler stores the entry after the clear, so a cleared entry reappears | 6 |
+| B11 | From reading, becomes live with 14 | 206 counts as cacheable 2xx. Once `Range` is forwarded, a partial body gets cached under the full URL key | 13 |
 
 ---
 
-### 1. Stop relaying a `content-length` that no longer describes the body — shipped
+## Phase A — Stop the crashes and the SSRF
 
-**Shipped as:** always-drop, via a dedicated `DECODED_BODY_HEADERS` set split
-out of `HOP_BY_HOP_HEADERS` (neither header is hop-by-hop; a separate set keeps
-a later tidy-up from reintroducing the truncation). HEAD responses lose
-`content-length` too — accepted until the compressed-bytes end state below.
-Regression test: "gzipped origin response is relayed in full on MISS and HIT"
-in `src/cache.test.ts`.
+Independent of each other; land in any order. Highest severity, smallest diffs.
 
-**Why:** confirmed data corruption, above. Security-adjacent — a truncated
-JSON body can parse as a different, still-valid document downstream. Highest
-severity, smallest diff.
+### 1. Lock the upstream origin (B1)
+- **1a** (~5 lines) After `new URL(req.url, origin)`, return 400 unless
+  `upstreamUrl.origin === new URL(origin).origin`. Hoist the parsed origin next to
+  `ORIGIN_HOST`.
+- Test: `//127.0.0.1:<other-stub>/x` and `/\evil.test/x` → 400, other stub hit count 0.
+  Repro command in `docs/commands.md`.
 
-**Change:** drop `content-length` from relayed + cached headers whenever the
-body is re-encoded. Node then chunks the MISS response and computes length
-itself on replay.
+### 2. Relay the body with `pipeline()` (B2)
+- **2a** (~6 lines) Replace `upstreamStream.pipe(res)` with
+  `pipeline(upstreamStream, res, err => …)`. On error, log it and `res.destroy(err)`
+  (headers are already sent by then, so a 502 isn't possible).
+- Test: stub writes part of the body, then destroys the socket. Assert the proxy survives
+  and the next request is served. Repro command in `docs/commands.md`.
 
-**Options:** always drop it *(recommended — maintainability: one entry in
-the existing strip-set, trivially testable with a gzip stub)*, vs. drop only
-when `content-encoding` was present (same fix, but couples two header
-decisions — easy to reintroduce), vs. stop decoding altogether and cache the
-compressed bytes with `content-encoding` intact keyed on `Vary:
-Accept-Encoding` (the efficiency-optimal end state — cuts JSON entry size
-~4-6× so the 5MB budget holds far more — but a rewrite of the fetch layer;
-belongs after no. 7). This third option is exactly what nginx/Varnish do by
-default: cache the wire representation, not the decoded one.
+### 3. Guard the `Location` parse (B3)
+- **3a** (~3 lines) Parse with `URL.canParse` (Node ≥19.9) or try/catch. If it can't be
+  parsed, relay the 3xx as-is.
+- Test: stub returns `Location: http://[bad`, assert the 3xx is relayed and the proxy
+  survives.
 
-**Touches:** `src/index.ts:9-19, 142-157`. Regression test: gzip stub,
-assert received byte count equals decoded length.
+### 4. Handler-level safety net
+- **4a** (~8 lines) Wrap the request handler body in try/catch: 502 if headers aren't
+  sent yet, `res.destroy()` if they are. Log with the request's method and path.
+- **4b** (~4 lines, `src/cli.ts`) `process.on("unhandledRejection")` logs and exits
+  non-zero, so a crash is loud rather than silent.
 
-### 2. Forward client request headers upstream
+### 5. Clean failure on listen error (B9)
+- **5a** (~5 lines, `src/cli.ts`) `server.on("error")`: print
+  `port <n> in use` for `EADDRINUSE`, exit 1.
 
-**Why:** confirmed dropped, above. Breaks auth, content negotiation, and
-conditional requests — the proxy can't front any API that needs a key.
+### 6. Make `DELETE /_cache` beat in-flight stores (B10)
+- **6a** (~5 lines) A `generation` counter, incremented on clear. Each miss captures it
+  before fetching; the `'end'` handler skips the store if it has changed.
+- Test: slow stub. Start a request, clear the cache, let the request finish, then assert
+  the next request is a MISS.
 
-**Change:** copy `req.headers` into the fetch init minus hop-by-hop headers
-and `host` (undici must derive `host` from the target URL; forwarding the
-client's `host` is a cache-poisoning vector). Add `X-Forwarded-For` /
-`X-Forwarded-Proto` / `Via`.
+## Phase B — Resource limits
 
-**Edge cases:** array-valued headers need flattening; inbound
-`content-length` must be dropped (body is streamed, not measured); inbound
-`accept-encoding` should be normalised rather than passed raw, or the
-origin's encoding choice varies per client while the cache key doesn't.
+### 7. Upstream timeout (B7)
+- **7a** (~4 lines) `signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)` on `fetchUpstream`.
+  Map `TimeoutError` to 504, not 502.
+- **7b** (~6 lines) `--timeout <ms>` flag, validated like `parsePort`. Depends on 21a.
 
-**Must not ship alone** — see no. 3.
+### 8. Abort upstream when the client leaves (B6)
+- **8a** (~8 lines) An `AbortController` per request, aborted on `res` `'close'` if the
+  response didn't finish. Combine it with 7a via `AbortSignal.any([...])`.
+- Must be revisited when 17 lands: a follower disconnecting must not abort the leader's
+  fetch.
+- Test: stub streams slowly; client aborts; assert the stub sees its socket close.
 
-**Touches:** `src/index.ts:96-108`.
+### 9. Server-side timeouts (B7)
+- **9a** (~4 lines) Set `headersTimeout`, `requestTimeout` and `keepAliveTimeout` on the
+  server explicitly, to guard against slow clients that trickle headers (Slowloris) and to
+  make the limits visible in code.
 
-### 3. Make the cache key honest: `Vary`, auth, private responses
+### 10. Graceful shutdown
+- **10a** (~6 lines, `src/cli.ts`) On SIGINT/SIGTERM: `server.close()`, exit when it
+  finishes.
+- **10b** (~5 lines) Drain deadline: after N seconds, `server.closeAllConnections()` and
+  exit 1.
 
-**Why:** the key is `method:url.href` (`src/index.ts:28-30`) and nothing
-else. That's only survivable today because no. 2 is broken. The moment
-`Authorization` is forwarded, one user's response is stored under a
-URL-only key and served to the next anonymous caller — the same class of
-leak `Set-Cookie` stripping already guards against for headers, but for the
-body.
+## Phase C — Correct caching
 
-**Change, in order:**
-1. Never cache a request carrying `Authorization` or `Cookie` — MISS every
-   time, relay through.
-2. Never cache a response carrying `Cache-Control: private` or `no-store`.
-3. Honour `Vary`: fold the named request headers into the cache key; treat
-   `Vary: *` as uncacheable.
+**Land 11–13 before 14.** Forwarding headers (14) without these steps turns the shared
+cache into a leak of one user's authorised responses to the next caller. 15–16 can follow.
 
-Step 1's real alternative — keying on a hash of the credential, correct per
-RFC 9111 §3.5 — is not worth the risk here: one hashing mistake is a
-cross-user leak, and it needs salting, constant-time comparison, and
-eviction interaction to do safely. That's the right call only once there's
-an actual multi-tenant workload behind this; for now, bypass is strictly
-safer and a two-line predicate.
+### 11. Bypass the cache for credentialed requests
+- **11a** (~4 lines) If the request has `authorization` or `cookie`, don't look it up and
+  don't store it; always MISS. Keying on a credential hash (RFC 9111 §3.5) is deliberately
+  not done: one mistake there is a cross-user leak.
 
-**Touches:** `src/index.ts:28-30, 72-94, 161-162`.
+### 12. Respect response `Cache-Control` on store
+- **12a** (~8 lines) Small `parseCacheControl(header)` → `Map<directive, value|true>`.
+- **12b** (~4 lines) Don't store `no-store`, `private`, or `Vary: *`.
 
-### 4. Honour HTTP cache semantics instead of a fixed 60s TTL
+### 13. Never cache partial content (B11)
+- **13a** (~2 lines) Restrict `cacheable` to status 200 (or exclude 206), and skip requests
+  that have `range`.
 
-**Why:** `TTL_MS` applies unconditionally (`src/index.ts:4, 75`). A
-`no-store` response gets cached; a `max-age=86400` response gets thrown away
-after 60 seconds. The proxy is simultaneously less safe and less useful than
-the origin asked for.
+### 14. Forward request headers (B4)
+- **14a** (~10 lines) Allowlist copy from `req.headers`: `accept`, `accept-language`,
+  `authorization`, `content-type`, `cookie`, `if-none-match`, `if-modified-since`,
+  `range`, `user-agent`. Flatten array values. Never forward `host`, `content-length` or
+  `accept-encoding` (undici sets and negotiates these itself). See decision D1.
+- **14b** (~4 lines) Add `X-Forwarded-For` (append), `X-Forwarded-Proto` and `Via`.
+- **14c** (~3 lines) Only attach a request body when the request declares one
+  (`content-length > 0` or `transfer-encoding` present). Today DELETE and OPTIONS always
+  send a streamed body, which some origins reject. *Unverified; confirm with an echo stub
+  first.*
+- Test: echo stub asserts `authorization` arrives **and** the response isn't cached
+  (the second assertion is the one that matters).
 
-**Change:** parse response `Cache-Control` (`no-store`, `no-cache`,
-`private`, `max-age`, `s-maxage`) and `Expires`; fall back to `TTL_MS` only
-when the origin says nothing. Honour request-side `no-cache` (forced
-revalidate) and `no-store`. Emit `Age` on HIT, refresh `Date`.
+### 15. Honour `Vary`
+- **15a** (~6 lines) Store the response's `Vary` header names on the `CacheEntry`.
+- **15b** (~8 lines) Build the key as `method:href` + the values of those request headers.
+  Lookup is two steps: find the entry by URL, then check whether the variant matches.
+- **(unsplittable below ~14 lines)**: 15a on its own changes nothing a test can see; ship
+  it with 15b.
 
-**Trade-off:** correctness costs hit-rate — an origin that sends `no-store`
-liberally will make the cache look useless. That's the origin's call, not
-the proxy's to override; a `--ignore-origin-cache-control` escape hatch (see
-no. 8) keeps a demo path available without making it the default.
+### 16. TTL from origin cache headers instead of a fixed 60s
+- **16a** (~8 lines) Add `ttlMs` to the entry, from `s-maxage` > `max-age` > `Expires`,
+  falling back to `TTL_MS`. The freshness check uses `entry.ttlMs`.
+- **16b** (~5 lines) Request-side `Cache-Control: no-cache` / `no-store` skip the lookup.
+- **16c** (~3 lines) Emit `Age` on a HIT.
+- **16d** (~3 lines) Use `performance.now()` for cache age, so a wall-clock jump can't
+  expire or revive every entry at once.
 
-**Touches:** `src/index.ts:72-94, 161-205`.
+## Phase D — Origin load and availability
 
-### 5. In-flight request coalescing (single-flight)
+### 17. Single-flight: one upstream fetch per key
+**(unsplittable below ~20 lines):** the leader/follower handoff doesn't work partly done;
+a half-built version either double-fetches or leaves followers hanging.
+- **17a** (~20 lines) `Map<key, Promise<CacheEntry | null>>`. The leader registers its
+  promise before fetching and removes it in `finally`; followers await it and replay the
+  entry, or fetch on their own if it's `null` (too large or not cacheable).
+- **17b** (~4 lines) Label followers `X-Cache: HIT-COALESCED` (see D3).
+- **17c** Revisit 8a: only the leader's own `res` close counts, and only when there are
+  no followers.
+- Test: 20 concurrent requests for one key → origin hit count 1.
 
-**Why:** N concurrent misses on the same key currently issue N upstream
-fetches (`src/index.ts:110-118`). A `seq 100 | xargs -P 100` burst is a
-100× origin amplification — a thundering herd against the origin, and 100
-simultaneous full-body buffers in flight against the byte budget, so the
-memory cap is bypassed under concurrency even though it holds fine
-sequentially. This is the item that makes the byte budget mean something
-under load, which is why it can't ship before the budget exists.
+### 18. Conditional revalidation
+- **18a** (~4 lines) Store `etag` / `last-modified` on the entry. Needs 14a so those
+  headers aren't stripped.
+- **18b** (~10 lines) When a cached entry has expired, keep it, send `If-None-Match` /
+  `If-Modified-Since`; on 304, refresh `cachedAt` and serve the stored body.
 
-**Change:** `Map<string, Promise<CacheEntry>>` of in-flight fetches
-alongside the cache. A miss registers its promise before awaiting;
-concurrent misses on the same key await that promise and replay the
-resolved entry. Delete in a `finally` so a rejected fetch doesn't pin a
-dead promise for everyone waiting on it.
+### 19. Opt-in `stale-if-error`
+- **19a** (~8 lines) Expired entries stay in the map instead of being deleted on read
+  (they're still bounded by the byte and entry caps). On upstream 5xx, timeout or
+  network error, serve the stale entry with `X-Cache: STALE` and `Age`, if it's within
+  the window.
+- **19b** (~5 lines) `--stale-if-error <seconds>`, default 0 (off). Serving stale data
+  during an outage has to be the caller's choice.
 
-**Edge cases:** a coalesced waiter needs its own `X-Cache` semantics (`MISS`
-for the leader; followers are arguably `HIT` — pick one, document it).
-Entries too large to cache can't be replayed to waiters at all, so those
-waiters fall through to their own fetch. A client abort must not cancel the
-leader's fetch out from under everyone else waiting on it.
+## Phase E — Admin surface, config, observability
 
-**Alternative outside the stack:** nginx `proxy_cache_lock`, Varnish request
-coalescing, or a Cloudflare Worker on the Cache API all do this natively,
-and better. Worth a README line that this reimplements it deliberately as
-an exercise, not as a recommendation to roll your own in production.
+### 20. Admin endpoint hardening (B8)
+- **20a** (~5 lines) Reject admin requests whose `Host` isn't `127.0.0.1:<port>` or
+  `localhost:<port>`. This blocks DNS rebinding from a browser, and it's needed even on a
+  loopback bind.
+- **20b** (~10 lines) `--admin-token` (or `CACHE_PROXY_ADMIN_TOKEN` env), checked against
+  a `Bearer` header with `crypto.timingSafeEqual`. `--clear-cache` sends it. See D2.
+- **20c** (~5 lines) `--admin-prefix` so `/_cache` can't shadow a real origin path.
 
-**Touches:** `src/index.ts:32-46, 110-118, 161-205`.
+### 21. Configurable knobs
+- **21a** (~10 lines) Plumbing only: move `TTL_MS`, `MAX_*` and the timeout into a
+  `config` object passed through `startServer`'s options, with the current constants as
+  defaults. No new flags yet.
+- **21b–e** (~5 lines each) One flag per step: `--ttl`, `--max-entries`, `--max-bytes`
+  (checking `max-entry-bytes <= max-bytes`), `--host`. Each is validated like
+  `parsePort`.
 
-### 6. Conditional revalidation and stale serving
+### 22. Stats endpoint
+- **22a** (~6 lines) Counters: hits, misses, evictions, stale serves, upstream errors.
+- **22b** (~8 lines) `GET <admin-prefix>/stats` → JSON
+  `{ entries, totalBytes, hits, misses, evictions, oldestAgeMs, … }`, behind the 20a/20b
+  checks.
 
-**Why:** on TTL expiry the entry is deleted (`src/index.ts:89-93`) and
-re-fetched in full, even when nothing changed. Most origins would answer
-`304 Not Modified` with no body at all — this is the difference between
-re-downloading 2KB of JSON and re-downloading nothing.
+### 23. Log hygiene
+- **23a** (~5 lines) Log the path only, with query values redacted (`?key=…`). Query
+  strings are where API keys live.
+- **23b** (~10 lines) `--log-level` (`error|info|debug`). Per-request HIT/MISS lines move
+  to `debug`.
 
-**Change:** store `etag` / `last-modified` on the entry; on expiry send
-`If-None-Match` / `If-Modified-Since`; on `304`, refresh `cachedAt` and serve
-the stored body unchanged. Add `stale-if-error`: when the origin is
-unreachable, serve an expired entry with `Warning`/`Age` instead of today's
-flat 502 (`src/index.ts:115`) — a cache that goes as dark as the origin the
-moment the origin has a bad day isn't buying you anything. Optionally
-`stale-while-revalidate`: serve stale immediately, refresh in the
-background.
+## Phase F — Hygiene
 
-**Trade-off:** stale-on-error is an availability dial, not a free win — make
-it opt-in (`--stale-if-error <seconds>`), because silently serving stale
-data during an outage is the wrong choice for some callers and they need to
-be able to say no.
-
-**Touches:** `src/index.ts:21-26, 89-118, 183-205`.
-
-### 7. Timeouts, stream error handling, abort propagation
-
-**Why:** three resource leaks, all durability issues for the *process*, not
-the data:
-- No timeout on `fetchUpstream` (`src/index.ts:98-108`) — a hanging origin
-  holds a client socket and a buffered entry indefinitely.
-- No `server.headersTimeout` / `requestTimeout` — slow-header clients
-  (Slowloris-style) hold connections open for free.
-- `upstreamStream.pipe(res)` (`src/index.ts:207`) doesn't forward errors. If
-  the client disconnects mid-body, `res` errors but `upstreamStream` is
-  never destroyed and its `end` handler never fires — the upstream socket
-  and whatever was buffered leak silently.
-
-**Change:** `AbortSignal.timeout(n)` on both fetch calls; `stream.pipeline()`
-instead of `pipe()`; `req.on("close")` aborting the upstream fetch when the
-client goes away (coordinated with no. 5 — don't abort a fetch other
-waiters still need); explicit `headersTimeout` / `requestTimeout` /
-`keepAliveTimeout` on the server.
-
-**Touches:** `src/index.ts:98-118, 164-211, 213-215`.
-
-### 8. Configurable knobs and a stats endpoint
-
-**Why:** `TTL_MS`, `MAX_ENTRIES`, `MAX_ENTRY_BYTES`, `MAX_BYTES` are module
-constants (`src/index.ts:4-7`) — changing any of them means editing source
-and rebuilding. There's also no way to see cache state short of reading the
-log line by line.
-
-**Change:** `--ttl`, `--max-entries`, `--max-bytes`, `--max-entry-bytes`,
-`--host`, `--log-level` in `parseArgs` (`src/cli.ts:9-15, 44-56`), validated
-the same way `parsePort` already is, threaded through `startServer`'s
-options object. Add `GET /_cache/stats` → `{ entries, totalBytes, hits,
-misses, evictions, oldestAge }` next to the existing `DELETE /_cache`.
-
-**Also here:** logging. `console.log` fires per request unconditionally
-(`src/index.ts:57`) and prints the full URL including the query string —
-which is where API keys live. Add levels; redact query values at `info` and
-below.
-
-**Touches:** `src/cli.ts:5-15, 37-85`; `src/index.ts:4-7, 32-70`.
-
-### 9. Graceful shutdown and admin-endpoint hardening
-
-**Why:** `SIGINT`/`SIGTERM` kills in-flight requests mid-body today —
-restarting the proxy truncates whatever was streaming through it at that
-moment. And `DELETE /_cache` (`src/index.ts:63-70`) is unauthenticated: the
-127.0.0.1 bind (`src/index.ts:213`) is doing the *entire* job of keeping
-that safe. Any local process can flush the cache, and the route shadows a
-real origin path if the origin ever happens to serve `/_cache`.
-
-**Change:** `server.close()` plus a drain deadline on `SIGINT`/`SIGTERM`.
-For the admin surface: an optional `--admin-token` compared with
-`crypto.timingSafeEqual` (never `===` — timing side-channel on a secret
-comparison), and `--admin-prefix` so the reserved namespace can move off a
-colliding origin path.
-
-**Trade-off:** a token on a loopback-only demo proxy is close to theatre —
-the real control is the bind address. Add it *only* alongside no. 8's
-`--host`, since that's the flag that lets someone bind `0.0.0.0` and make
-the token matter. State that coupling explicitly in the README so it isn't
-mistaken for real auth on its own.
-
-**Touches:** `src/index.ts:59-70, 213-218`; `src/cli.ts:44-56`.
-
-### 10. Close the test gaps these changes open
-
-**Why:** `docs/commands.md` already concedes the SSRF guard is untested
-end-to-end — "guarantee is structural," not verified by a running test.
-That's the one behaviour here where a silent regression is a security bug,
-and the suite already has the machinery for it
-(`src/utils/testHelpers.ts` spins a stub origin per test).
-
-**Change:**
-- Stub origin issuing a cross-host `Location` → assert the 3xx relays,
-  isn't followed (covers `src/index.ts:124-137`).
-- Gzip stub → assert received bytes equal decoded length (regression for
-  no. 1).
-- Header-echo stub → assert `Authorization` reaches the origin *and* the
-  response isn't cached (regression for nos. 2 + 3 together — the second
-  half of that assertion is the one that actually matters).
-- Concurrent burst on one key → assert exactly one upstream fetch (no. 5).
-- Client-disconnect mid-stream → assert the upstream socket is destroyed
-  (no. 7).
-
-**Touches:** `src/redirect.test.ts`, `src/cache.test.ts`,
-`src/utils/testHelpers.ts`.
+- **24a** (~2 lines) Move `typescript`, `@types/node` to `devDependencies`.
+- **24b** (~2 lines) Add a `typecheck` script (`tsc --noEmit`). Right now the test run
+  (`tsx`) skips type checking.
+- **24c** (~6 lines, optional) Answer HEAD from a cached GET entry (headers only).
+- **24d** (~4 lines, optional) Strip headers named in the upstream `Connection` header
+  (RFC 9110 §7.6.1), not just the fixed hop-by-hop set.
 
 ---
 
-## Explicitly out of scope
+## Open decisions
 
-- **Disk/Redis persistence.** Ruled out by design, not by oversight:
-  `--clear-cache` works *because* the cache lives in the same process the
-  CLI talks to over HTTP. Durability here means the process doesn't leak
-  sockets or corrupt bytes while it's running (nos. 7, 9) — not that cache
-  contents survive a restart. A restart clearing the cache is correct
-  behaviour for this tool, not a gap.
-- **Caching non-GET methods.** Correct invalidation semantics for writes is
-  a materially larger piece of work than anything above and changes the
-  proxy's risk profile (a stale cached write is a data-integrity bug, not a
-  staleness annoyance).
-- **HTTPS listener / TLS termination and any hosting/deployment concerns.**
-  Origin-side HTTPS already works via `fetch`. Everything above is about
-  what the proxy does with bytes it already has; where the process runs is
-  a separate, later question.
+**D1 — Header forwarding: allowlist (recommended) vs blocklist**
+- *Security:* allowlist wins. With a blocklist, every header the cache key ignores
+  (`X-Forwarded-Host`, `X-Original-URL`, …) can change the origin's response and poison
+  the shared cache for everyone. An allowlist makes that opt-in.
+- *Maintainability:* blocklist is less code and doesn't need touching per header.
+  Allowlist needs an entry for each new header a user relies on.
+- *DX:* blocklist "just works". With an allowlist, a missing header is a silent failure,
+  so log dropped header names at `debug`.
+- *Cost:* $0 either way.
+- *Outside the stack:* Varnish and nginx use a blocklist and rely on configured cache
+  keys. That's workable only because their keys are configurable, and ours aren't.
+- **Decided by: security.**
 
-## Suggested sequencing
+**D2 — Admin auth: `Host` check only vs `Host` + token (recommended once `--host` exists)**
+- *Security:* the `Host` check (20a) closes DNS rebinding, which is the real threat on
+  loopback. A token only matters once `--host 0.0.0.0` exists (21e); on loopback it
+  doesn't add real protection.
+- *DX:* the token adds a secret to pass to `--clear-cache`. An env var keeps that cheap.
+- *Alternative:* serving admin on a unix socket gives OS-level permissions with no token,
+  but it's harder to test and doesn't work for Windows users.
+- Recommendation: ship 20a now. Ship 20b in the same change as 21e (`--host`), not before.
+- **Decided by: security relative to maintainability.**
 
-Nos. 1–3 are one cluster, land together or in immediate succession — no. 2
-without no. 3 is a regression in safety, not an improvement. Nos. 4–7 are
-independent after that. Nos. 8–10 can land at any point; no. 10 should
-trail each of the others by one commit rather than being saved for the end,
-so the regression coverage exists before the next change lands on top of it.
+**D3 — `X-Cache` for coalesced followers: `HIT` vs `MISS` vs `HIT-COALESCED`**
+- `HIT-COALESCED` is honest, and it helps debugging (it shows the cache is protecting the
+  origin). It breaks nothing that checks with `startsWith("HIT")`, and costs one string.
+- **Recommended: `HIT-COALESCED`. Decided by: DX (debuggability).**
 
-## Cost note
+## Out of scope
 
-$0 throughout — local CLI, no runtime dependencies, no infra. The one cost
-axis that's real is **origin request volume**, and nos. 5 and 6 are the two
-items that reduce it: no. 5 by roughly the burst concurrency factor, no. 6
-by the 304-vs-200 body size difference.
+- **Disk/Redis persistence.** Ruled out on purpose: `--clear-cache` works because the
+  cache lives in the same process the CLI calls over HTTP. A restart clearing the cache is
+  correct behaviour.
+- **Caching non-GET methods.** Invalidation for writes is a much larger job, and a stale
+  cached write is a data-integrity bug.
+- **TLS termination / deployment.** Origin-side HTTPS already works through `fetch`.
+- **Caching compressed bytes keyed on `Vary: Accept-Encoding`** (what nginx and Varnish
+  do). Would fit roughly 4–6× more JSON into the byte budget, but it's a rewrite of the
+  fetch layer. Revisit after Phase C.
+
+## Sequencing
+
+1. **Phase A** (1–6): any order, each on its own. Do these first.
+2. **Phase B** (7–10): after A. Item 8 before 17.
+3. **Phase C**: 11 → 12 → 13 → 14, strictly in that order. Then 15 and 16 in either
+   order.
+4. **Phase D**: 17 needs 8. 18 needs 14a. 19 needs 16a.
+5. **Phase E**: 21a before any flag. 20b together with 21e. 22 after 20a.
+6. **Phase F**: any time.
+
+Each step ships with its test in the same commit, not saved up for the end, so the
+regression test exists before the next step builds on it.
