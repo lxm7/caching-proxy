@@ -23,11 +23,20 @@ npx tsx --test --test-timeout=20000 --test-name-pattern="gzipped" src/cache.test
 npx tsx --test --test-name-pattern="B10" src/admin.test.ts   # clear-mid-fetch race, step 6a
 npx tsx --test --test-name-pattern="B6" src/abort.test.ts    # client-disconnect abort, step 9a
 npx tsx --test --test-name-pattern="504" src/timeout.test.ts # upstream-timeout 504, step 8a
+npx tsx --test --test-name-pattern="TTL has elapsed" src/cache.test.ts # TTL-from-headers regression, step 16a
 ```
 
 The `--test-name-pattern="504"` line above, plus `npm test` (x3), were re-run after fixing
 `timeout.test.ts`'s config setup (it was mutating the shared `DEFAULT_CONFIG` singleton
 and reverting it before any request was handled) to confirm the flake is gone.
+
+`npx tsc --noEmit` and `npm test` were re-run after Phase C chunk 1 (steps 11-14: credential
+bypass, `Cache-Control` on store, partial-content exclusion, request-header forwarding) and
+again after chunk 2 (steps 15-16: `Vary`-aware keying, TTL from origin headers). Chunk 2
+required rewriting the TTL-elapsed test above: it used to fake expiry by mocking `Date.now()`,
+which no longer works now that freshness is checked against `performance.now()` (16a, by
+design — a wall-clock jump must not expire or revive entries) — it now uses a real short
+`ttlMs` and a real wait instead.
 
 Each test runs its own stub origin and proxy on port `0` — no live upstream,
 no clash with a proxy on 3000.

@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { gzipSync } from "node:zlib";
-import { TTL_MS, MAX_ENTRIES, MAX_ENTRY_BYTES, MAX_BYTES } from "./index.js";
-import { setup, type RouteHandler } from "./utils/testHelpers.js";
+import { DEFAULT_CONFIG, MAX_ENTRIES, MAX_ENTRY_BYTES, MAX_BYTES } from "./index.js";
+import { setup, startProxy, startStubOrigin, type RouteHandler } from "./utils/testHelpers.js";
 
 function hasPath(value: unknown): value is { path: string } {
   return (
@@ -37,17 +37,18 @@ test("repeat request for the same URL is a HIT and does not re-hit the origin", 
 });
 
 test("entry re-fetches from origin once the TTL has elapsed", async (t) => {
-  const { origin, proxy } = await setup(t);
+  const origin = await startStubOrigin();
+  // Freshness (16a) is checked against performance.now(), not Date.now(), so
+  // it can't be faked by mocking Date — a short real ttlMs and a real wait is
+  // what actually exercises expiry now.
+  const proxy = await startProxy(origin.url, { ...DEFAULT_CONFIG, ttlMs: 20 });
+  t.after(() => {
+    origin.server.close();
+    proxy.server.close();
+  });
 
   await fetch(`${proxy.url}/thing`);
-
-  // Advances Date.now() only — no real 60s wait, and doesn't touch the real
-  // timers the HTTP stack relies on underneath. Must seed with the real
-  // clock: enable() defaults the fake clock to epoch 0, which would make
-  // Date.now() go backwards relative to the already-recorded cachedAt.
-  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
-  t.mock.timers.tick(TTL_MS + 1);
-
+  await new Promise((resolve) => setTimeout(resolve, 40));
   const res = await fetch(`${proxy.url}/thing`);
 
   assert.equal(res.headers.get("x-cache"), "MISS");

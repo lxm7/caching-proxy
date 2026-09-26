@@ -4,6 +4,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
+import { performance } from "node:perf_hooks";
 import { pipeline, Readable } from "node:stream";
 
 export const TTL_MS = 60_000;
@@ -48,7 +49,8 @@ interface CacheEntry {
   status: number;
   headers: Record<string, string>;
   body: Buffer;
-  cachedAt: number;
+  storedAt: number; // performance.now() — monotonic, immune to wall-clock jumps
+  ttlMs: number;
 }
 
 function cacheKey(method: string, url: URL): string {
@@ -67,6 +69,45 @@ function parseCacheControl(header: string | null): Map<string, string | true> {
     directives.set(name, rawValue === undefined ? true : rawValue.trim().replace(/^"|"$/g, ""));
   }
   return directives;
+}
+
+// accept-encoding is excluded: this proxy always fully decodes the body and
+// strips content-encoding/content-length before storing (DECODED_BODY_HEADERS),
+// and never forwards the client's accept-encoding upstream (undici negotiates
+// its own). So every stored entry is already identical regardless of what the
+// client asked for — varying the key on it would only fragment the cache.
+const IGNORED_VARY_HEADERS = new Set(["accept-encoding"]);
+
+function parseVaryNames(header: string | null): string[] {
+  if (!header) return [];
+  return header
+    .split(",")
+    .map((name) => name.trim().toLowerCase())
+    .filter((name) => name && !IGNORED_VARY_HEADERS.has(name));
+}
+
+function varySuffix(varyNames: string[], headers: IncomingHttpHeaders): string {
+  return varyNames.map((name) => `${name}=${headers[name] ?? ""}`).join("&");
+}
+
+// s-maxage > max-age > Expires > the configured default. Expires needs one
+// wall-clock read (it's an absolute date); freshness checks after storage
+// compare against performance.now() instead, so a later clock jump can't
+// expire or revive every entry at once.
+function resolveTtlMs(
+  cacheControl: Map<string, string | true>,
+  expiresHeader: string | null,
+  fallbackMs: number,
+): number {
+  const sMaxAge = Number(cacheControl.get("s-maxage"));
+  if (Number.isFinite(sMaxAge) && sMaxAge >= 0) return sMaxAge * 1000;
+  const maxAge = Number(cacheControl.get("max-age"));
+  if (Number.isFinite(maxAge) && maxAge >= 0) return maxAge * 1000;
+  if (expiresHeader) {
+    const expiresInMs = Date.parse(expiresHeader) - Date.now();
+    if (Number.isFinite(expiresInMs)) return Math.max(expiresInMs, 0);
+  }
+  return fallbackMs;
 }
 
 // Allowlist, not a blocklist (D1): a header the cache key ignores could
@@ -141,6 +182,10 @@ export function startServer({
   const ORIGIN_URL = new URL(origin);
   const ORIGIN_HOST = ORIGIN_URL.host;
   const cache = new Map<string, CacheEntry>();
+  // Base key ("method:href") -> the header names an earlier response for that
+  // URL declared as its Vary axis. Populated on store (15a); consulted on
+  // lookup (15b) to build the key that actually matches this request's variant.
+  const varyByUrl = new Map<string, string[]>();
   let totalBytes = 0;
   // Bumped on every /_cache clear. A store captures this before fetching and
   // checks it again in the 'end' handler, so a clear mid-fetch can't have its
@@ -195,10 +240,21 @@ export function startServer({
       return;
     }
 
-    if (method === "GET" && !hasCredentials) {
-      const key = cacheKey(method, upstreamUrl);
+    // 16b: request-side no-cache/no-store skips the read, same as a
+    // credentialed request — the fetch below still runs and may refresh
+    // whatever's stored.
+    const requestCacheControl = parseCacheControl(req.headers["cache-control"] ?? null);
+    const bypassCacheRead = requestCacheControl.has("no-cache") || requestCacheControl.has("no-store");
+
+    if (method === "GET" && !hasCredentials && !bypassCacheRead) {
+      // 15b: the base key finds this URL's known variant axis, if any
+      // response for it ever declared one; that axis's header values then
+      // pick out which stored variant actually matches this request.
+      const baseKey = cacheKey(method, upstreamUrl);
+      const varyNames = varyByUrl.get(baseKey) ?? [];
+      const key = varyNames.length > 0 ? `${baseKey}|${varySuffix(varyNames, req.headers)}` : baseKey;
       const cached = cache.get(key);
-      if (cached && Date.now() - cached.cachedAt < config.ttlMs) {
+      if (cached && performance.now() - cached.storedAt < cached.ttlMs) {
         // Map preserves insertion order; re-inserting the key on every hit
         // moves it to the end, so oldest-first iteration below is LRU, not FIFO.
         cache.delete(key);
@@ -208,6 +264,7 @@ export function startServer({
           res.setHeader(name, value);
         }
         res.setHeader("X-Cache", "HIT");
+        res.setHeader("Age", String(Math.floor((performance.now() - cached.storedAt) / 1000)));
         res.writeHead(cached.status);
         res.end(cached.body);
         return;
@@ -313,6 +370,15 @@ export function startServer({
       upstreamRes.headers.get("vary") !== "*" &&
       (!hasCredentials || cacheControl.get("public") === true);
 
+    // 15a/15b: record this URL's variant axis (if any) so later requests can
+    // build the matching key, and use it now to build the key this response
+    // itself stores under.
+    const baseKey = cacheKey(method, upstreamUrl);
+    const varyNames = parseVaryNames(upstreamRes.headers.get("vary"));
+    if (cacheable && varyNames.length > 0) varyByUrl.set(baseKey, varyNames);
+    const storeKey = varyNames.length > 0 ? `${baseKey}|${varySuffix(varyNames, req.headers)}` : baseKey;
+    const ttlMs = resolveTtlMs(cacheControl, upstreamRes.headers.get("expires"), config.ttlMs);
+
     if (upstreamRes.body) {
       const upstreamStream = Readable.fromWeb(upstreamRes.body);
       if (cacheable) {
@@ -333,31 +399,31 @@ export function startServer({
           }
         });
         upstreamStream.on("end", () => {
-          const key = cacheKey(method, upstreamUrl);
           if (generation !== requestGeneration) {
-            console.log(`SKIPPED (cleared mid-fetch) ${key}`);
+            console.log(`SKIPPED (cleared mid-fetch) ${storeKey}`);
             return;
           }
           if (tooLargeToCache) {
-            console.log(`SKIPPED (too large) ${key}`);
+            console.log(`SKIPPED (too large) ${storeKey}`);
             return;
           }
           const body = Buffer.concat(chunks);
-          const existing = cache.get(key);
+          const existing = cache.get(storeKey);
           if (existing) {
-            cache.delete(key);
+            cache.delete(storeKey);
             totalBytes -= existing.body.byteLength;
           }
           while (cache.size >= config.maxEntries && evictOldest()) {}
           while (totalBytes + body.byteLength > config.maxBytes && evictOldest()) {}
-          cache.set(key, {
+          cache.set(storeKey, {
             status: upstreamRes.status,
             headers: cacheableHeaders,
             body,
-            cachedAt: Date.now(),
+            storedAt: performance.now(),
+            ttlMs,
           });
           totalBytes += body.byteLength;
-          console.log(`STORED ${key}`);
+          console.log(`STORED ${storeKey}`);
         });
       }
       pipeline(upstreamStream, res, (err) => {
