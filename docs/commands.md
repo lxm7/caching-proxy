@@ -101,6 +101,20 @@ sc '//[bad'            # 400 — unparseable, proxy stays up
 npx tsx --test --test-name-pattern='host" request-target' src/admin.test.ts
 ```
 
+## Origin behaviour reference (dummyjson.com)
+
+```sh
+curl -sD - -o /dev/null https://dummyjson.com/products/1
+curl -sD - -o /dev/null -X POST https://dummyjson.com/auth/login -H "Content-Type: application/json" -d '{"username":"emilys","password":"emilyspass"}'
+TOKEN=$(curl -s -X POST https://dummyjson.com/auth/login -H "Content-Type: application/json" -d '{"username":"emilys","password":"emilyspass"}' | python3 -c "import json,sys; print(json.load(sys.stdin)['accessToken'])")
+curl -sD - -o /dev/null https://dummyjson.com/auth/me -H "Authorization: Bearer $TOKEN"
+```
+
+Checked ahead of item 12's `Cache-Control: public` override (Phase C, chunk 1): dummyjson never
+sends `public` on any of these — `/products/1` sends `no-store`, `/auth/login` and `/auth/me`
+send no `Cache-Control` header at all. Informed the decision to keep the override store-side
+only (no read-side symmetric case), tested against a local stub rather than live dummyjson.
+
 ## Open bugs (see `plan.md`)
 
 Header forwarding — B4, step 14a:

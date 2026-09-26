@@ -120,8 +120,15 @@ Independent of each other; land in any order. Highest severity, smallest diffs.
 
 ## Phase C — Correct caching
 
-**Land 11–13 before 14.** Forwarding headers (14) without these steps turns the shared
-cache into a leak of one user's authorised responses to the next caller. 15–16 can follow.
+**Chunk 1 — land 11, 12, 13, 14 as one commit.** Forwarding headers (14) without the
+other three turns the shared cache into a leak of one user's authorised responses to the
+next caller. Bundled rather than split further: 11 (credential bypass) and 13 (partial-
+content exclusion) are both unfalsifiable against a real origin until 14 forwards the
+headers they guard (`Authorization`/`Cookie`, `Range`) — per the bug table, B11 "becomes
+live with 14." Splitting them into their own commits buys no real bisect safety, since
+neither has independently observable behaviour; it only produces synthetic-stub tests in
+place of one real one. Internal order within the commit stays 11 → 12 → 13 → 14. Chunk 2
+(15–16) follows after, as its own commit.
 
 **Before starting 11:** reconsider whether `handleRequest` should split into a small
 middleware pipeline (`(req, res, next) => void`, hand-rolled, no dependency — stays inside
@@ -133,13 +140,31 @@ as its own stage instead of growing the one function further. Not a blocker — 
 sequential code in `handleRequest` still works if the answer is "not yet."
 
 ### 11. Bypass the cache for credentialed requests
-- **11a** (~4 lines) If the request has `authorization` or `cookie`, don't look it up and
-  don't store it; always MISS. Keying on a credential hash (RFC 9111 §3.5) is deliberately
-  not done: one mistake there is a cross-user leak.
+- **11a** (~4 lines) If the request has `authorization` or `cookie`, don't look it up;
+  always MISS on the read side, unconditionally (12c only widens what can be *stored*, not
+  what a credentialed request can read back). Keying on a credential hash (RFC 9111 §3.5)
+  is deliberately not done: one mistake there is a cross-user leak.
 
 ### 12. Respect response `Cache-Control` on store
 - **12a** (~8 lines) Small `parseCacheControl(header)` → `Map<directive, value|true>`.
 - **12b** (~4 lines) Don't store `no-store`, `private`, or `Vary: *`.
+- **12c** (~3 lines) Store-side-only override: widen `cacheable` so a credentialed
+  request's response is still stored when the response carries `Cache-Control: public`
+  (RFC 9111 §3.5's explicit exception). Deliberately store-side only — the *read* path
+  keeps 11a's hard bypass unconditionally, so a credentialed request never gets served
+  from the cache even for an entry stored under this override. A full symmetric version
+  (a `public` flag on `CacheEntry`, checked on lookup so a credentialed *reader* can also
+  get a HIT) was considered and dropped: checked live against dummyjson (`docs/commands.md`,
+  "Origin behaviour reference") and it never sends `public` anywhere — `/products/1` sends
+  `no-store`, `/auth/login` and `/auth/me` send no `Cache-Control` at all. Building the
+  read-side branch now would add new `CacheEntry` state and a two-phase lookup in the same
+  commit as header forwarding — the riskiest item in this plan — against zero real
+  coverage. Revisit only if a real origin under test is ever seen sending `public` on a
+  credentialed response.
+- Test (12c): local stub, not dummyjson (which can't be made to emit `public`) —
+  credentialed request to a `Cache-Control: public` response stores; a second credentialed
+  request to the same URL still MISSes (read bypass holds); a third, anonymous request
+  HITs the stored entry.
 
 ### 13. Never cache partial content (B11)
 - **13a** (~2 lines) Restrict `cacheable` to status 200 (or exclude 206), and skip requests
@@ -154,10 +179,15 @@ sequential code in `handleRequest` still works if the answer is "not yet."
   (`content-length > 0` or `transfer-encoding` present). Today DELETE and OPTIONS always
   send a streamed body, which some origins reject. *Unverified; confirm with an echo stub
   first.*
-- Test: echo stub asserts `authorization` arrives **and** the response isn't cached
-  (the second assertion is the one that matters).
+- Chunk-1 test (11/13/14): dummyjson end-to-end — log in as two different demo users
+  (`POST /auth/login`), both `GET /auth/me` through the proxy with their own `Bearer`
+  token; assert neither ever sees the other's profile and `X-Cache` is `MISS` both times.
+  Plus a `Range` request against a real dummyjson response (not cached), and confirmation
+  that `/products/1`'s real `Cache-Control: no-store` (`docs/commands.md`) isn't cached.
 - `X-Forwarded-For` / `X-Forwarded-Proto` / `Via` moved to 24e: they don't fix B4, so they
   don't need to sit on Phase C's strict-order critical path.
+
+**Chunk 2 — land 15 and 16 together, as one commit, after chunk 1.**
 
 ### 15. Honour `Vary`
 - **15a** (~6 lines) Store the response's `Vary` header names on the `CacheEntry`.
@@ -293,8 +323,8 @@ Plumbing (config object, `defineFlag` helper) now lives in item 7. Each flag bel
 1. **Phase A** (1–6): any order, each on its own. Do these first.
 2. **Phase B** (7–10): after A. Do 7 (config plumbing) first — 8b and every later flag
    depend on it. Item 9 before 17.
-3. **Phase C**: 11 → 12 → 13 → 14, strictly in that order. Then 15 and 16 in either
-   order.
+3. **Phase C**: chunk 1 (11 → 12 → 13 → 14, strictly in that order) lands as one commit.
+   Chunk 2 (15–16) lands as a second commit, after chunk 1.
 4. **Phase D**: 17 needs 9. 18 needs 14a. 19 needs 16a.
 5. **Phase E**: 20b together with 21d (`--host`). 22 after 20a.
 6. **Phase F**: any time.

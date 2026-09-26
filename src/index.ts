@@ -1,4 +1,9 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  createServer,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import { pipeline, Readable } from "node:stream";
 
 export const TTL_MS = 60_000;
@@ -48,6 +53,45 @@ interface CacheEntry {
 
 function cacheKey(method: string, url: URL): string {
   return `${method}:${url.href}`;
+}
+
+// Directive values are the literal token/quoted-string after "=", or `true`
+// for a valueless directive like `no-store` or `public`.
+function parseCacheControl(header: string | null): Map<string, string | true> {
+  const directives = new Map<string, string | true>();
+  if (!header) return directives;
+  for (const part of header.split(",")) {
+    const [rawName, rawValue] = part.split("=", 2);
+    const name = rawName.trim().toLowerCase();
+    if (!name) continue;
+    directives.set(name, rawValue === undefined ? true : rawValue.trim().replace(/^"|"$/g, ""));
+  }
+  return directives;
+}
+
+// Allowlist, not a blocklist (D1): a header the cache key ignores could
+// otherwise change the origin's response and poison the shared cache for
+// everyone. Never host/content-length/accept-encoding — undici sets and
+// negotiates those itself.
+const FORWARDED_REQUEST_HEADERS = [
+  "accept",
+  "accept-language",
+  "authorization",
+  "content-type",
+  "cookie",
+  "if-none-match",
+  "if-modified-since",
+  "range",
+  "user-agent",
+] as const;
+
+function buildUpstreamHeaders(reqHeaders: IncomingHttpHeaders): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const name of FORWARDED_REQUEST_HEADERS) {
+    const value = reqHeaders[name];
+    if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(", ") : value;
+  }
+  return headers;
 }
 
 // Explicit rather than left at Node's defaults (60s/300s/5s), so the limits
@@ -129,6 +173,14 @@ export function startServer({
     const method = req.method ?? "GET";
     console.log(`${method} - ${req.url} - ${upstreamUrl.href}`);
 
+    // Credentialed requests always MISS: the cache is one shared Map across all
+    // clients, so serving or storing a response fetched with one caller's
+    // authorization/cookie would leak it to the next caller (B11-adjacent auth
+    // bypass). Not keyed on a credential hash (RFC 9111 §3.5) — one mistake
+    // there is a cross-user leak, and this whole plan trades a bit of origin
+    // load for that safety margin.
+    const hasCredentials = Boolean(req.headers.authorization || req.headers.cookie);
+
     // Handled locally, never forwarded: dummyjson.com has no /_cache route, so
     // this is purely an admin endpoint on the proxy itself. Intercepting it
     // here (before any upstream fetch) is what lets a `--clear-cache` CLI flag
@@ -143,7 +195,7 @@ export function startServer({
       return;
     }
 
-    if (method === "GET") {
+    if (method === "GET" && !hasCredentials) {
       const key = cacheKey(method, upstreamUrl);
       const cached = cache.get(key);
       if (cached && Date.now() - cached.cachedAt < config.ttlMs) {
@@ -167,7 +219,13 @@ export function startServer({
       }
     }
 
-    const hasBody = method !== "GET" && method !== "HEAD";
+    const isBodylessMethod = method === "GET" || method === "HEAD";
+    // B4/14b: DELETE and OPTIONS used to always get a streamed body attached
+    // even with nothing to send, which some origins reject. A body is only
+    // declared, per RFC 9110, via content-length or transfer-encoding.
+    const hasDeclaredBody =
+      !isBodylessMethod &&
+      (Number(req.headers["content-length"]) > 0 || req.headers["transfer-encoding"] !== undefined);
     const requestGeneration = generation;
 
     // If the client goes away — before headers, or mid-stream — before we're
@@ -182,8 +240,9 @@ export function startServer({
     const fetchUpstream = (url: URL) =>
       fetch(url, {
         method,
-        body: hasBody ? Readable.toWeb(req) : undefined,
-        duplex: hasBody ? "half" : undefined,
+        headers: buildUpstreamHeaders(req.headers),
+        body: hasDeclaredBody ? Readable.toWeb(req) : undefined,
+        duplex: hasDeclaredBody ? "half" : undefined,
         // Never let fetch auto-follow: a redirect Location is upstream-controlled,
         // and following blindly is an SSRF vector (upstream could redirect to an
         // internal address). Each hop is validated against ORIGIN_HOST below
@@ -202,7 +261,7 @@ export function startServer({
     // (e.g. dummyjson.com) can be resolved into a cacheable 2xx. Bounded to one
     // hop, and only followed when Location's host matches ORIGIN — anything
     // else (different host/port) stays a relayed 3xx rather than being fetched.
-    if (!hasBody && upstreamRes.status >= 300 && upstreamRes.status < 400) {
+    if (isBodylessMethod && upstreamRes.status >= 300 && upstreamRes.status < 400) {
       const location = upstreamRes.headers.get("location");
       // URL.parse (not the constructor) so a malformed Location — e.g.
       // `http://[bad` — falls through to relaying the 3xx as-is instead of
@@ -240,8 +299,19 @@ export function startServer({
 
     res.writeHead(upstreamRes.status);
 
+    // B11/13a: 206 is deliberately excluded (not just >=200/<300) — a partial
+    // body must never be stored under the same key as the full resource. The
+    // incoming `range` check is defence in depth for the same reason, in case
+    // an origin ever answers a Range request with 200 instead of 206.
+    const cacheControl = parseCacheControl(upstreamRes.headers.get("cache-control"));
     const cacheable =
-      method === "GET" && upstreamRes.status >= 200 && upstreamRes.status < 300;
+      method === "GET" &&
+      !req.headers.range &&
+      upstreamRes.status === 200 &&
+      !cacheControl.has("no-store") &&
+      !cacheControl.has("private") &&
+      upstreamRes.headers.get("vary") !== "*" &&
+      (!hasCredentials || cacheControl.get("public") === true);
 
     if (upstreamRes.body) {
       const upstreamStream = Readable.fromWeb(upstreamRes.body);
