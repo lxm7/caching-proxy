@@ -21,7 +21,13 @@ npx tsc -p tsconfig.json --noEmit
 npm test
 npx tsx --test --test-timeout=20000 --test-name-pattern="gzipped" src/cache.test.ts   # one test by name
 npx tsx --test --test-name-pattern="B10" src/admin.test.ts   # clear-mid-fetch race, step 6a
+npx tsx --test --test-name-pattern="B6" src/abort.test.ts    # client-disconnect abort, step 9a
+npx tsx --test --test-name-pattern="504" src/timeout.test.ts # upstream-timeout 504, step 8a
 ```
+
+The `--test-name-pattern="504"` line above, plus `npm test` (x3), were re-run after fixing
+`timeout.test.ts`'s config setup (it was mutating the shared `DEFAULT_CONFIG` singleton
+and reverting it before any request was handled) to confirm the flake is gone.
 
 Each test runs its own stub origin and proxy on port `0` — no live upstream,
 no clash with a proxy on 3000.

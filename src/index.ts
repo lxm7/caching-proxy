@@ -170,6 +170,15 @@ export function startServer({
     const hasBody = method !== "GET" && method !== "HEAD";
     const requestGeneration = generation;
 
+    // If the client goes away — before headers, or mid-stream — before we're
+    // done, stop holding the upstream socket open for a response nobody will
+    // read. `writableEnded` is only true once *we* called `res.end()`, so a
+    // 'close' after that is a normal completion, not an abandonment.
+    const clientAbort = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) clientAbort.abort();
+    });
+
     const fetchUpstream = (url: URL) =>
       fetch(url, {
         method,
@@ -180,10 +189,10 @@ export function startServer({
         // internal address). Each hop is validated against ORIGIN_HOST below
         // before we ever issue a second request.
         redirect: "manual",
-        // Fresh per call (not shared across the redirect hop below), so each
-        // upstream request gets its own full budget rather than splitting one
-        // clock across both.
-        signal: AbortSignal.timeout(config.timeoutMs),
+        // Timeout is fresh per call (not shared across the redirect hop below),
+        // so each upstream request gets its own full budget rather than
+        // splitting one clock across both. clientAbort is shared across both.
+        signal: AbortSignal.any([AbortSignal.timeout(config.timeoutMs), clientAbort.signal]),
       });
 
     let upstreamRes = await fetchOrRelayError(() => fetchUpstream(upstreamUrl), res);
