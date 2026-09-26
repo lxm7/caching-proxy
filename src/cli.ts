@@ -34,6 +34,21 @@ function defineFlag<T>(
 const parsePort = defineFlag("--port", Number, (n) => Number.isInteger(n) && n >= 1 && n <= 65535);
 const parseTimeout = defineFlag("--timeout", Number, (n) => Number.isInteger(n) && n > 0);
 
+const DRAIN_TIMEOUT_MS = 10_000;
+
+// Stop accepting new connections and let in-flight requests finish on their
+// own; if any are still open after the drain deadline, force them closed
+// rather than hang forever waiting on a client that never comes back.
+function shutdown(server: ReturnType<typeof startServer>): void {
+  console.log("shutting down...");
+  server.close(() => process.exit(0));
+  setTimeout(() => {
+    console.error(`drain deadline (${DRAIN_TIMEOUT_MS}ms) exceeded, forcing remaining connections closed`);
+    server.closeAllConnections();
+    process.exit(1);
+  }, DRAIN_TIMEOUT_MS);
+}
+
 async function clearCache(portArg: string | undefined): Promise<void> {
   const port = portArg !== undefined ? parsePort(portArg) : 3000;
   let res: Response;
@@ -107,6 +122,8 @@ async function main(): Promise<void> {
     console.error(err.code === "EADDRINUSE" ? `port ${port} in use` : err.message);
     process.exit(1);
   });
+  process.on("SIGINT", () => shutdown(server));
+  process.on("SIGTERM", () => shutdown(server));
 }
 
 main();
