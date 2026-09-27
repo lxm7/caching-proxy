@@ -24,6 +24,7 @@ npx tsx --test --test-name-pattern="B10" src/admin.test.ts   # clear-mid-fetch r
 npx tsx --test --test-name-pattern="B6" src/abort.test.ts    # client-disconnect abort, step 9a
 npx tsx --test --test-name-pattern="504" src/timeout.test.ts # upstream-timeout 504, step 8a
 npx tsx --test --test-name-pattern="TTL has elapsed" src/cache.test.ts # TTL-from-headers regression, step 16a
+npx tsx --test src/singleflight.test.ts # coalescing (17a/17b) + leader-disconnect (17c)
 ```
 
 The `--test-name-pattern="504"` line above, plus `npm test` (x3), were re-run after fixing
@@ -37,6 +38,15 @@ required rewriting the TTL-elapsed test above: it used to fake expiry by mocking
 which no longer works now that freshness is checked against `performance.now()` (16a, by
 design — a wall-clock jump must not expire or revive entries) — it now uses a real short
 `ttlMs` and a real wait instead.
+
+Item 17 (single-flight): `npx tsc --noEmit` and `npm test` were re-run repeatedly while
+debugging a real hang caught by an ad hoc script before `src/singleflight.test.ts` existed —
+`.pipe(res)`/`pipeline(upstreamStream, res, ...)` on an already-destroyed `res` (the
+coalescing leader's own client can disconnect while followers still wait on its fetch, 17c)
+throws inside the stream's internal 'data' dispatch, silently killing the stream with no more
+`data`/`end` ever firing — which hung every follower forever, not just that one leader. Fixed
+by skipping pipe/pipeline entirely once `res.destroyed`; the existing buffering listeners
+already drive the stream to completion on their own.
 
 Each test runs its own stub origin and proxy on port `0` — no live upstream,
 no clash with a proxy on 3000.

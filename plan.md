@@ -209,22 +209,55 @@ sequential code in `handleRequest` still works if the answer is "not yet."
 
 ## Phase D — Origin load and availability
 
-### 17. Single-flight: one upstream fetch per key
+### 17. Single-flight: one upstream fetch per key — **shipped, well over the ~20-line estimate**
 **(unsplittable below ~20 lines):** the leader/follower handoff doesn't work partly done;
-a half-built version either double-fetches or leaves followers hanging.
-- **17a** (~20 lines) `Map<key, Promise<CacheEntry | null>>`. The leader registers its
-  promise before fetching and removes it in `finally`; followers await it and replay the
-  entry, or fetch on their own if it's `null` (too large or not cacheable).
-- **17b** (~4 lines) Label followers `X-Cache: HIT-COALESCED` (see D3).
-- **17c** Revisit 9a: only the leader's own `res` close counts, and only when there are
-  no followers.
-- Test: 20 concurrent requests for one key → origin hit count 1.
+a half-built version either double-fetches or leaves followers hanging. The estimate held for
+the happy path; it didn't account for what 17c actually costs once you follow it through —
+final diff was closer to 90 lines across `src/index.ts`, plus `src/singleflight.test.ts`.
+- **17a** `Map<key, { promise: Promise<CacheEntry | null>; followerCount: number }>`, keyed by
+  the same Vary-aware key as the cache itself (15b). The leader registers before fetching and
+  removes itself via `promise.finally()`; followers await it and replay the entry, or —
+  if it resolves `null` (not cacheable, too large, or cleared mid-fetch) — fall through to
+  fetch independently. `null` is settled as soon as it's known (right after `cacheable` is
+  computed, not after the body finishes), so followers of a non-cacheable leader don't wait
+  out a download they can't use.
+- **17b** Followers get `X-Cache: HIT-COALESCED` (D3).
+- **17c** The leader's own client disconnecting must not abort a fetch followers are relying
+  on: `clientAbort.abort()` is gated on `followerCount === 0`. That alone wasn't enough —
+  two further problems only showed up once actually tested (see below), both now fixed:
+  - **Every leader exit path must settle the promise**, not just the success path — both
+    `fetchOrRelayError` failures, a bodyless response, and the two `on("end")` early-outs
+    (generation mismatch, too-large) all needed an explicit `settleInFlight(null)`. Miss one
+    and every follower for that key hangs forever, not just errors — worse than the bug this
+    item fixes. (One gap remains, accepted: a synchronous throw during header-relay/cacheable
+    computation itself — e.g. `res.setHeader` throwing for a reason unrelated to a dead
+    connection — still isn't caught, and would wedge that one key until restart. Narrow,
+    pre-existing-shape code, judged not worth a broader try/catch.)
+  - **`pipeline()`/`.pipe(res)` on an already-destroyed `res` silently wedges the stream.**
+    Found by actually testing 17c (client disconnects mid-fetch, followers still attached):
+    by the time the origin responds, the leader's own `res` is already dead, and both
+    `pipeline()` and plain `.pipe()` write to it as part of the stream's internal `'data'`
+    dispatch — that write throws, and the throw kills `upstreamStream` with no more `data`/
+    `end` ever firing, hanging every follower indefinitely. Fixed: skip pipe/pipeline
+    entirely when `res.destroyed`; the buffering `data`/`end` listeners (already attached for
+    caching) drive the stream to completion on their own regardless of `res`'s state.
+- **Known accepted gap, shared with 15:** the very first concurrent burst for a URL that
+  turns out to vary (no entry in `varyByUrl` yet) coalesces onto one fetch before the Vary
+  axis is known — e.g. two simultaneous first-ever requests with different `Accept-Language`
+  get the same coalesced response. Once `varyByUrl` is populated (after that first fetch),
+  later concurrent requests correctly split into separate single-flight slots per variant.
+  This is the same "first-store race" 15b already accepted (self-heals via TTL), sharpened
+  by 17 into a guaranteed same-body case for that one initial burst rather than a narrow
+  timing race. Not fixed here — would need probing/deferring coalescing until Vary is known.
+- Test: `src/singleflight.test.ts` — 20 concurrent requests for one key → origin hit count 1,
+  1 MISS + 19 `HIT-COALESCED`; leader disconnects mid-fetch with two followers attached →
+  both followers still get served correctly, origin hit count still 1.
 
 ### 18. Conditional revalidation
 - **18a** (~4 lines) Store `etag` / `last-modified` on the entry. Needs 14a so those
   headers aren't stripped.
 - **18b** (~10 lines) When a cached entry has expired, keep it, send `If-None-Match` /
-  `If-Modified-Since`; on 304, refresh `cachedAt` and serve the stored body.
+  `If-Modified-Since`; on 304, refresh `storedAt` and serve the stored body.
 
 ### 19. Opt-in `stale-if-error`
 - **19a** (~8 lines) Expired entries stay in the map instead of being deleted on read

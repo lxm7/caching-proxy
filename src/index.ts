@@ -186,6 +186,12 @@ export function startServer({
   // URL declared as its Vary axis. Populated on store (15a); consulted on
   // lookup (15b) to build the key that actually matches this request's variant.
   const varyByUrl = new Map<string, string[]>();
+  // 17: coalesces concurrent GET requests for the same key into one upstream
+  // fetch. The leader registers its promise before fetching and removes it
+  // in `finally`; followers await it and replay the entry, or — if it
+  // resolves null (not cacheable, too large, or cleared mid-fetch) — fetch
+  // on their own, same as an ordinary miss.
+  const inFlight = new Map<string, { promise: Promise<CacheEntry | null>; followerCount: number }>();
   let totalBytes = 0;
   // Bumped on every /_cache clear. A store captures this before fetching and
   // checks it again in the 'end' handler, so a clear mid-fetch can't have its
@@ -246,6 +252,14 @@ export function startServer({
     const requestCacheControl = parseCacheControl(req.headers["cache-control"] ?? null);
     const bypassCacheRead = requestCacheControl.has("no-cache") || requestCacheControl.has("no-store");
 
+    // 17: set only if this request becomes the leader for a coalescing slot
+    // below. Read again much later, both to decide whether this client's own
+    // disconnect is allowed to abort the shared fetch (17c), and to choose
+    // how the response body is piped to this client (see the pipe/pipeline
+    // split near the stream setup).
+    let inFlightRecord: { promise: Promise<CacheEntry | null>; followerCount: number } | null = null;
+    const settleInFlight: { current: ((entry: CacheEntry | null) => void) | null } = { current: null };
+
     if (method === "GET" && !hasCredentials && !bypassCacheRead) {
       // 15b: the base key finds this URL's known variant axis, if any
       // response for it ever declared one; that axis's header values then
@@ -274,6 +288,39 @@ export function startServer({
         totalBytes -= cached.body.byteLength;
         console.log(`EXPIRED ${key}`);
       }
+
+      // 17a: one upstream fetch per key. A concurrent request either replays
+      // the leader's outcome below, or — if the leader's response wasn't
+      // cacheable — falls through to fetch independently, same as an
+      // ordinary miss.
+      const inFlightFetch = inFlight.get(key);
+      if (inFlightFetch) {
+        inFlightFetch.followerCount++;
+        const entry = await inFlightFetch.promise;
+        inFlightFetch.followerCount--;
+        if (entry) {
+          for (const [name, value] of Object.entries(entry.headers)) {
+            res.setHeader(name, value);
+          }
+          res.setHeader("X-Cache", "HIT-COALESCED"); // D3
+          res.setHeader("Age", String(Math.floor((performance.now() - entry.storedAt) / 1000)));
+          res.writeHead(entry.status);
+          res.end(entry.body);
+          return;
+        }
+      } else {
+        let settled = false;
+        const promise = new Promise<CacheEntry | null>((resolve) => {
+          settleInFlight.current = (entry: CacheEntry | null) => {
+            if (settled) return;
+            settled = true;
+            resolve(entry);
+          };
+        });
+        inFlightRecord = { promise, followerCount: 0 };
+        inFlight.set(key, inFlightRecord);
+        promise.finally(() => inFlight.delete(key));
+      }
     }
 
     const isBodylessMethod = method === "GET" || method === "HEAD";
@@ -291,7 +338,11 @@ export function startServer({
     // 'close' after that is a normal completion, not an abandonment.
     const clientAbort = new AbortController();
     res.on("close", () => {
-      if (!res.writableEnded) clientAbort.abort();
+      if (res.writableEnded) return;
+      // 17c: followers may still be waiting on this leader's fetch — only
+      // this client leaving is not enough reason to cut it short for them too.
+      if (inFlightRecord && inFlightRecord.followerCount > 0) return;
+      clientAbort.abort();
     });
 
     const fetchUpstream = (url: URL) =>
@@ -312,7 +363,10 @@ export function startServer({
       });
 
     let upstreamRes = await fetchOrRelayError(() => fetchUpstream(upstreamUrl), res);
-    if (!upstreamRes) return;
+    if (!upstreamRes) {
+      settleInFlight.current?.(null);
+      return;
+    }
 
     // GET/HEAD have no body to replay, so a same-origin http->https redirect
     // (e.g. dummyjson.com) can be resolved into a cacheable 2xx. Bounded to one
@@ -326,13 +380,19 @@ export function startServer({
       const redirectTarget = location ? URL.parse(location, upstreamUrl) : null;
       if (redirectTarget && redirectTarget.host === ORIGIN_HOST) {
         upstreamRes = await fetchOrRelayError(() => fetchUpstream(redirectTarget), res);
-        if (!upstreamRes) return;
+        if (!upstreamRes) {
+          settleInFlight.current?.(null);
+          return;
+        }
       }
     }
 
     // Mirrors the relayed headers, minus set-cookie: the cache is one shared Map across
     // all clients, so replaying one client's cookies to another on a cache hit would leak
     // sessions. set-cookie still passes through untouched on this (cache-miss) response.
+    // Built from upstreamRes regardless of this client's own state (below), since a
+    // single-flight leader (17) whose own connection is already gone must still cache
+    // a correct, complete entry for any followers waiting on it.
     const cacheableHeaders: Record<string, string> = {};
     for (const [name, value] of upstreamRes.headers) {
       const lower = name.toLowerCase();
@@ -343,18 +403,29 @@ export function startServer({
       ) {
         continue;
       }
-      res.setHeader(name, value);
       cacheableHeaders[name] = value;
     }
     // headers.entries()/forEach join multiple Set-Cookie into one invalid comma-joined
     // string; getSetCookie() is the only way to get them back out separately.
     const setCookie = upstreamRes.headers.getSetCookie();
-    if (setCookie.length > 0) {
-      res.setHeader("set-cookie", setCookie);
-    }
-    res.setHeader("X-Cache", "MISS");
 
-    res.writeHead(upstreamRes.status);
+    // 17c: this client can disconnect while its fetch is still the one
+    // followers are waiting on (that's the whole point of not aborting it —
+    // see the clientAbort gate above). By the time the origin responds,
+    // res.setHeader/writeHead on an already-dead connection throws; that must
+    // not stop the response from being read and cached below for them.
+    try {
+      for (const [name, value] of Object.entries(cacheableHeaders)) {
+        res.setHeader(name, value);
+      }
+      if (setCookie.length > 0) {
+        res.setHeader("set-cookie", setCookie);
+      }
+      res.setHeader("X-Cache", "MISS");
+      res.writeHead(upstreamRes.status);
+    } catch (err) {
+      console.error("failed to relay headers to a client that already disconnected:", err);
+    }
 
     // B11/13a: 206 is deliberately excluded (not just >=200/<300) — a partial
     // body must never be stored under the same key as the full resource. The
@@ -379,6 +450,11 @@ export function startServer({
     const storeKey = varyNames.length > 0 ? `${baseKey}|${varySuffix(varyNames, req.headers)}` : baseKey;
     const ttlMs = resolveTtlMs(cacheControl, upstreamRes.headers.get("expires"), config.ttlMs);
 
+    // 17: not cacheable, so there's nothing a follower could replay — tell
+    // them now (rather than after the body finishes) so they can go fetch
+    // independently right away instead of waiting for a download they can't use.
+    if (!cacheable) settleInFlight.current?.(null);
+
     if (upstreamRes.body) {
       const upstreamStream = Readable.fromWeb(upstreamRes.body);
       if (cacheable) {
@@ -401,10 +477,12 @@ export function startServer({
         upstreamStream.on("end", () => {
           if (generation !== requestGeneration) {
             console.log(`SKIPPED (cleared mid-fetch) ${storeKey}`);
+            settleInFlight.current?.(null);
             return;
           }
           if (tooLargeToCache) {
             console.log(`SKIPPED (too large) ${storeKey}`);
+            settleInFlight.current?.(null);
             return;
           }
           const body = Buffer.concat(chunks);
@@ -415,24 +493,56 @@ export function startServer({
           }
           while (cache.size >= config.maxEntries && evictOldest()) {}
           while (totalBytes + body.byteLength > config.maxBytes && evictOldest()) {}
-          cache.set(storeKey, {
+          const entry: CacheEntry = {
             status: upstreamRes.status,
             headers: cacheableHeaders,
             body,
             storedAt: performance.now(),
             ttlMs,
-          });
+          };
+          cache.set(storeKey, entry);
           totalBytes += body.byteLength;
           console.log(`STORED ${storeKey}`);
+          settleInFlight.current?.(entry);
         });
       }
-      pipeline(upstreamStream, res, (err) => {
-        if (err) {
+      if (res.destroyed) {
+        // 17c: this client is already gone — its own disconnect was deliberately
+        // not allowed to abort the fetch while followers were waiting on it (the
+        // clientAbort gate above), so the response has to be consumed to
+        // completion with nowhere to relay it. Piping into an already-destroyed
+        // res isn't just pointless: pipe()/pipeline() write to it internally as
+        // part of the stream's own 'data' dispatch, and that write throws —
+        // silently wedging the stream with no more 'data' or 'end' ever firing,
+        // which would hang every follower forever. Cacheable responses are
+        // already being driven by the 'data'/'end' listeners above; anything
+        // else just gets dropped.
+        if (!cacheable) upstreamStream.destroy();
+      } else if (inFlightRecord && cacheable) {
+        // pipeline() cross-destroys both ends on either side failing — exactly
+        // what item 9 wants when nobody else cares, but wrong here: this
+        // client's *later* disconnect (after this point) must not tear the
+        // shared upstream stream down out from under any followers still
+        // buffering it. Plain pipe() only unpipes on a destination problem,
+        // leaving upstreamStream (and the 'data'/'end' listeners above)
+        // running to completion regardless. The explicit error listener keeps
+        // B2's guarantee — an upstream error still reaches this client —
+        // without pipeline's reverse coupling.
+        upstreamStream.on("error", (err) => {
           console.error("upstream stream error:", err);
-          res.destroy(err);
-        }
-      });
+          if (!res.writableEnded) res.destroy(err);
+        });
+        upstreamStream.pipe(res);
+      } else {
+        pipeline(upstreamStream, res, (err) => {
+          if (err) {
+            console.error("upstream stream error:", err);
+            res.destroy(err);
+          }
+        });
+      }
     } else {
+      settleInFlight.current?.(null);
       res.end();
     }
   }
